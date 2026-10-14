@@ -5,13 +5,13 @@ from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from app.config import settings
-from app.database import Base
+from app.database import Base, normalize_database_url
 from app import models  # noqa: F401
 
 config = context.config
-database_url = settings.DATABASE_URL.get_secret_value().replace(
-    "postgresql://", "postgresql+asyncpg://", 1
-)
+database_url = normalize_database_url(
+    settings.DATABASE_URL.get_secret_value()
+).render_as_string(hide_password=False)
 # Alembic stores this value through ConfigParser, where percent signs are
 # interpolation markers. Preserve URL-encoded credentials such as `%40`.
 config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
@@ -36,6 +36,7 @@ async def run_async_migrations() -> None:
         connect_args={
             "statement_cache_size": 0,
             "prepared_statement_cache_size": 0,
+            "timeout": settings.DATABASE_CONNECT_TIMEOUT_SECONDS,
         },
     )
     async with connectable.connect() as connection:

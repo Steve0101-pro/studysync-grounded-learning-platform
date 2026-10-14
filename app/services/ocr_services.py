@@ -3,12 +3,13 @@ import logging
 from PIL import Image
 import pytesseract
 from pytesseract import Output
-import platform 
+
+from app.config import settings
 
 logger = logging.getLogger("app.ocr")
 
-if platform.system() == "Windows":
-    pytesseract.pytesseract.tesseract_cmd = r"C:\Users\User\Tesseract-OCR\tesseract.exe"
+if settings.TESSERACT_CMD:
+    pytesseract.pytesseract.tesseract_cmd = settings.TESSERACT_CMD
 
 
 def load_image(file_bytes: bytes) -> Image.Image:

@@ -1,1015 +1,413 @@
-# 🧠 Document Intelligence
+# StudySync
 
-> **Production-grade multimodal document intelligence platform built
-> with FastAPI, Streamlit, PostgreSQL, Redis, Supabase Storage, NVIDIA
-> VLM, Groq Whisper, Gemini, LangSmith, and AWS.**
+StudySync is a source-grounded study companion. It turns course PDFs,
+PowerPoint decks, and lecture videos into searchable material, answers learner
+questions with citations to that material, offers source-based practice, and
+summarizes practice activity.
 
-[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](#)
-[![FastAPI](https://img.shields.io/badge/FastAPI-API-009688?logo=fastapi&logoColor=white)](#)
-[![Streamlit](https://img.shields.io/badge/Streamlit-UI-FF4B4B?logo=streamlit&logoColor=white)](#)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Database-4169E1?logo=postgresql&logoColor=white)](#)
-[![Redis](https://img.shields.io/badge/Redis-Cache-DC382D?logo=redis&logoColor=white)](#)
-[![AWS](https://img.shields.io/badge/AWS-Production-232F3E?logo=amazonaws&logoColor=white)](#)
-[![LangSmith](https://img.shields.io/badge/LangSmith-Observability-1C1C1C)](#)
+The project has two runnable applications:
 
-------------------------------------------------------------------------
+- **Streamlit** provides the learner workspace.
+- **FastAPI** provides authentication, ingestion, retrieval, tutor, practice,
+  and progress APIs.
 
-## ✨ What is this?
+StudySync is an evolving prototype. Some capabilities described below are
+implemented while larger-scale ingestion, validated learning outcomes, and
+production performance remain to be established. The app labels practice
+signals as revision aids rather than validated mastery measurements.
 
-**Document Intelligence** is a production-oriented AI application for
-turning documents, images, audio, and multimodal questions into
-structured, useful answers.
+## Contents
 
-The platform supports two major workflows:
+- [How it works](#how-it-works)
+- [Learner workflow](#learner-workflow)
+- [Technology](#technology)
+- [Requirements](#requirements)
+- [Local setup](#local-setup)
+- [Configuration](#configuration)
+- [Run StudySync](#run-studysync)
+- [Use the app](#use-the-app)
+- [API overview](#api-overview)
+- [Evaluation](#evaluation)
+- [Tests and checks](#tests-and-checks)
+- [Known limits](#known-limits)
+- [Troubleshooting](#troubleshooting)
+- [Repository map](#repository-map)
 
-### 📄 Document Intelligence
+## How it works
 
-Upload an invoice or supported document image and run:
-
--   OCR and text extraction
--   Layout-aware extraction
--   Structured invoice extraction
--   Vision-language model analysis
--   Persistent document storage
-
-### 🎙️ Multimodal Intelligence
-
-Send:
-
--   🎤 an audio question
--   🖼️ an optional image
--   🧠 conversational context
-
-The system can combine speech recognition, vision, reasoning, and
-text-to-speech into a single multimodal workflow.
-
-------------------------------------------------------------------------
-
-# 🚀 Core Capabilities
-
-  -----------------------------------------------------------------------
-  Capability                          What it provides
-  ----------------------------------- -----------------------------------
-  🔐 Authentication                   JWT registration, login, password
-                                      recovery, protected APIs
-
-  👥 Authorization                    User ownership and
-                                      administrator-controlled review
-                                      workflows
-
-  📄 OCR                              Extract text from supported
-                                      document images
-
-  👁️ VLM extraction                   Vision-language analysis and
-                                      structured invoice extraction
-
-  🎤 Speech-to-text                   Audio question processing through
-                                      Groq
-
-  🧠 Multimodal reasoning             Gemini-based reasoning over text,
-                                      audio-derived context, and images
-
-  🔊 Text-to-speech                   Native Gemini speech generation
-
-  🗄️ Storage                          Supabase Storage for
-                                      uploaded/generated assets
-
-  🐘 Database                         Async SQLAlchemy + PostgreSQL
-
-  ⚡ Caching                          Redis-backed caching and runtime
-                                      support
-
-  📊 Observability                    LangSmith tracing and application
-                                      monitoring
-
-  🧪 Evaluation                       Versioned offline evaluation suite
-                                      and regression gates
-
-  ⚖️ Human review                     User feedback and administrator
-                                      review queue
-
-  🛡️ AI safety                        Prompt-injection and
-                                      credential-exfiltration checks
-
-  🐳 Containers                       Separate API and Streamlit images
-
-  🔄 CI/CD                            Automated image build, registry
-                                      push, and production deployment
-
-  ☁️ AWS                              Production deployment behind an
-                                      Application Load Balancer
-  -----------------------------------------------------------------------
-
-------------------------------------------------------------------------
-
-# 🏗️ System Architecture
-
-``` text
-                                  ┌──────────────────────┐
-                                  │      User / Browser  │
-                                  └──────────┬───────────┘
-                                             │
-                                             ▼
-                                  ┌──────────────────────┐
-                                  │    Streamlit UI      │
-                                  │       :8501          │
-                                  └──────────┬───────────┘
-                                             │
-                                             ▼
-                           ┌────────────────────────────────┐
-                           │        FastAPI Backend :8000   │
-                           │                                │
-                           │  Auth • Documents • Multimodal│
-                           │  Feedback • Health • Monitoring│
-                           └───────┬─────────┬─────────┬────┘
-                                   │         │         │
-                    ┌──────────────┘         │         └──────────────┐
-                    ▼                        ▼                        ▼
-             ┌─────────────┐        ┌─────────────┐        ┌────────────────┐
-             │ PostgreSQL  │        │    Redis    │        │ AI / Providers │
-             │             │        │             │        │                │
-             │ Users       │        │ Cache       │        │ NVIDIA VLM     │
-             │ Documents   │        │ Runtime     │        │ Groq Whisper   │
-             │ Feedback    │        │ Support     │        │ Gemini          │
-             │ Audit data  │        │             │        │ Portkey        │
-             └─────────────┘        └─────────────┘        └───────┬────────┘
-                                                                    │
-                                                                    ▼
-                                                           ┌────────────────┐
-                                                           │ Supabase       │
-                                                           │ Storage        │
-                                                           └────────────────┘
-
-                           Observability / Evaluation
-                                     │
-                    ┌────────────────┴────────────────┐
-                    ▼                                 ▼
-              ┌────────────┐                    ┌────────────┐
-              │ LangSmith  │                    │ Eval Suite │
-              │ Tracing    │                    │ + Review   │
-              └────────────┘                    └────────────┘
+```text
+PDF / PowerPoint / lecture video
+              │
+              ▼
+    Extract text and locations
+    PDF pages · slide numbers · video timestamps
+              │
+              ▼
+    Build parent and child passages
+              │
+       ┌──────┴──────┐
+       ▼             ▼
+   PostgreSQL     Qdrant vectors
+       │             │
+       └──────┬──────┘
+              ▼
+   BM25 + vector retrieval
+              │
+              ▼
+    Grounded tutor and citations
+              │
+       ┌──────┴──────┐
+       ▼             ▼
+   Practice       Progress view
+       └──────┬──────┘
+              ▼
+       Evaluation tools
 ```
 
-## 🔁 Multimodal request flow
+The API stores user-owned sources and passages in PostgreSQL. Qdrant provides
+semantic retrieval; a lexical search path remains available if vector search
+is unavailable. Tutor requests retrieve course evidence first. The model is
+instructed to answer from that evidence and cite it. Citation markers are
+validated before a generated response is accepted. If evidence is missing,
+or configured models cannot return a valid cited answer, the tutor reports the
+gap or shows a source excerpt instead of presenting an uncited answer as
+grounded.
 
-``` text
-Audio + optional Image
-        │
-        ▼
- FastAPI /multimodal
-        │
-        ├──► Safety checks
-        │
-        ├──► Groq Whisper
-        │       └──► Transcript
-        │
-        ├──► Gemini multimodal reasoning
-        │       ├── transcript
-        │       ├── image
-        │       ├── conversation context
-        │       └── optional tools
-        │
-        └──► Gemini TTS
-                │
-                ▼
-          Audio response
-                │
-                ▼
-             Streamlit
-```
+## Learner workflow
 
-------------------------------------------------------------------------
+1. **Create an account or sign in.** Protected API endpoints use the signed-in
+   learner's identity to scope sources, conversations, quizzes, and progress.
+2. **Add course materials.** Upload a PDF, PowerPoint (`.pptx`), MP4, or WebM
+   file from the Study workspace. Ingestion extracts text and preserves page,
+   slide, or transcript timestamp locations.
+3. **Ask a question.** The tutor searches uploaded material and streams an
+   answer. Each answer's citations identify the supporting source location.
+   Conversation history supports follow-up questions.
+4. **Use optional media in context.** A learner can record a question for
+   transcription, attach an image or figure, or ask about an uploaded lecture
+   video. These inputs feed the course tutor rather than replacing course
+   retrieval with an unrelated response.
+5. **Practice.** Generate a question from a source passage, submit an answer,
+   and review the supporting passage and feedback.
+6. **Review progress.** The dashboard shows source totals and practice
+   outcomes. Accuracy is based on answered practice questions, not uploaded
+   resources. Small samples are shown with a confidence interval; topic
+   estimates are explicitly not calibrated mastery scores.
+7. **Inspect evaluation.** The RAGAS Evaluation page presents the saved
+   evaluation report and its status. It is clearly marked exploratory when
+   cases are machine-generated or model responses are not actual deployed
+   tutor runs.
 
-# 🧩 Technology Stack
+## Technology
 
-### Backend
+- **Python**, **FastAPI**, and **Pydantic** for the API and validation.
+- **Streamlit** for the learner and evaluation interfaces.
+- **PostgreSQL**, **SQLAlchemy**, and **Alembic** for persistent data and
+  schema migrations.
+- **Qdrant** and **FastEmbed** for vector indexing and semantic search.
+- **BM25-style lexical retrieval** for keyword matching and retrieval fallback.
+- **LangGraph** for the study-tutor flow.
+- **NVIDIA API Catalog** for configured tutor and vision models.
+- **Groq Whisper** for speech transcription; a configured Gemini model can
+  provide transcription fallback.
+- **Supabase Storage** for configured document storage.
+- **Redis** for optional cache and related runtime services.
+- **Neo4j** for optional concept and source-term indexing.
+- **RAGAS** in a separate optional evaluation environment.
 
--   **FastAPI** --- asynchronous REST API
--   **Pydantic / Pydantic Settings** --- validation and configuration
--   **SQLAlchemy Async** --- database access
--   **Alembic** --- schema migrations
--   **JWT** --- authentication
--   **Redis** --- caching/runtime support
+Optional services may be omitted in development when their relevant workflow
+supports a local or graceful fallback. The database and model credentials
+needed for the workflows you intend to use must still be configured.
 
-### AI
+## Requirements
 
--   **NVIDIA VLM** --- vision and document extraction
--   **Portkey** --- AI gateway/provider routing
--   **Groq Whisper** --- speech-to-text
--   **Nnvidia Nemotrome** --- multimodal reasoning upgraded 
--   **Gemini TTS** --- native speech generation
+- Windows 10/11, macOS, or Linux.
+- Python 3.11 or later (Python 3.12 is recommended).
+- PostgreSQL, local or managed.
+- API credentials for at least one supported tutor provider. NVIDIA is the
+  first configured tutor provider; Groq and OpenAI are optional fallbacks.
+- Additional credentials only for the features you use: Supabase Storage,
+  Groq/Gemini transcription, Qdrant Cloud, Redis, and Neo4j.
+- Tesseract OCR is optional for scanned documents. Set `TESSERACT_CMD` if it
+  is installed outside `PATH`.
 
-### Data & Storage
+## Local setup
 
--   **PostgreSQL**
--   **Supabase Storage**
--   **Redis**
+Open PowerShell in the repository root.
 
-### Observability & Evaluation
+### 1. Create and activate a virtual environment
 
--   **LangSmith**
--   Offline regression evaluation
--   LLM-as-judge evaluation
--   Human review workflows
--   Append-only evaluation/audit metadata
-
-### Deployment
-
--   Docker
--   GitHub Actions
--   Amazon ECR
--   Amazon ECS
--   Application Load Balancer
--   AWS security groups
-
-------------------------------------------------------------------------
-
-# 📁 Project Structure
-
-``` text
-document-intelligence/
-│
-├── app/
-│   ├── main.py
-│   ├── config.py
-│   ├── database.py
-│   ├── models.py
-│   ├── schema.py
-│   │
-│   ├── api/
-│   │   ├── auth.py
-│   │   ├── documents.py
-│   │   ├── multimodal_router.py
-│   │   ├── feedback.py
-│   │   └── monitoring.py
-│   │
-│   ├── dependencies/
-│   │   └── auth.py
-│   │
-│   └── services/
-│       ├── ocr_service.py
-│       ├── vlm_service.py
-│       ├── stt_services.py
-│       ├── tts_services.py
-│       ├── multimodal.py
-│       ├── storage.py
-│       ├── cache.py
-│       └── portkeys_service.py
-│
-├── evals/
-│   ├── golden cases
-│   ├── responses.json
-│   └── run_offline.py
-│
-├── tests/
-│
-├── alembic/
-│
-├── streamlit_app.py
-├── Dockerfile.api
-├── Dockerfile.ui
-├── docker-compose.yml
-├── requirements.txt
-├── .env.example
-└── .github/
-    └── workflows/
-        └── CI/CD workflow
-```
-
-------------------------------------------------------------------------
-
-# ⚙️ Configuration
-
-Create a `.env` file in the project root.
-
-> ⚠️ **Never commit production secrets to Git.**
-
-``` env
-# -----------------------------
-# Database
-# -----------------------------
-DATABASE_URL=postgresql+asyncpg://user:password@host:5432/document_intelligence
-
-# -----------------------------
-# Redis
-# -----------------------------
-REDIS_URL=redis://host:6379/0
-
-# -----------------------------
-# Authentication
-# -----------------------------
-JWT_SECRET_KEY=replace-with-a-long-random-secret
-JWT_ALGORITHM=HS256
-ACCESS_TOKEN_EXPIRE_MINUTES=60
-
-# -----------------------------
-# Application
-# -----------------------------
-ENVIRONMENT=development
-CORS_ORIGINS=http://localhost:8501
-
-# -----------------------------
-# Gemini
-# -----------------------------
-GEMINI_API_KEY=replace-me
-GEMINI_MODEL=gemini-2.0-flash
-GEMINI_TTS_MODEL=gemini-2.0-flash
-
-# -----------------------------
-# Groq
-# -----------------------------
-GROQ_API_KEY=replace-me
-GROQ_MODEL=mixtral-8x7b-32768
-
-# -----------------------------
-# NVIDIA
-# -----------------------------
-NVIDIA_API_KEY=replace-me
-NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
-NVIDIA_PRIMARY_MODEL=meta/llama-3.2-90b-vision-instruct
-
-# -----------------------------
-# Supabase
-# -----------------------------
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SERVICE_KEY=replace-me
-SUPABASE_BUCKET_NAME=documents
-
-# -----------------------------
-# Portkey
-# -----------------------------
-PORTKEYS_ENABLED=false
-PORTKEYS_API_KEY=
-
-# -----------------------------
-# Evaluation
-# -----------------------------
-ONLINE_EVAL_ENABLED=false
-ONLINE_EVAL_SAMPLE_RATE=1.0
-```
-
-------------------------------------------------------------------------
-
-# 💻 Local Development
-
-## 1. Create / activate the environment
-
-Windows PowerShell:
-
-``` powershell
-.\doc-intell\Scripts\Activate.ps1
-```
-
-Install dependencies:
-
-``` powershell
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-## 2. Run migrations
+If PowerShell blocks environment activation, use the environment's executable
+directly:
 
-``` powershell
-alembic upgrade head
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-## 3. Start FastAPI
+### 2. Configure environment variables
 
-``` powershell
-uvicorn app.main:app --reload
+```powershell
+Copy-Item .env.example .env
 ```
 
-API:
+Edit `.env` with local development credentials and connection strings. Keep
+`.env` private: do not commit it, paste its contents into issue trackers, or
+include API keys in logs.
 
-``` text
-http://localhost:8000
+### 3. Prepare the database
+
+Create an empty PostgreSQL database, set `DATABASE_URL` in `.env`, and apply
+the schema:
+
+```powershell
+.\.venv\Scripts\alembic.exe upgrade head
 ```
 
-Swagger:
+For development, the API connects to the database specified by
+`DATABASE_URL`. Use the same database for migrations and runtime.
 
-``` text
-http://localhost:8000/docs
+## Configuration
+
+The full variable list and safe placeholders are in
+[`.env.example`](./.env.example). Key settings:
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | PostgreSQL connection string. |
+| `JWT_SECRET_KEY` | Secret used to sign authentication tokens. |
+| `NVIDIA_API_KEY` | Enables the configured NVIDIA tutor and vision models. |
+| `NVIDIA_BASE_URL` | NVIDIA API Catalog OpenAI-compatible endpoint. |
+| `STUDY_TUTOR_NVIDIA_MODEL` | First NVIDIA model attempted for grounded tutoring. The tested default is `nvidia/nemotron-3-super-120b-a12b`. |
+| `NVIDIA_PRIMARY_MODEL` | Additional NVIDIA reasoning model used by tutor and multimodal workflows. |
+| `NVIDIA_FALLBACK_MODEL` | Additional NVIDIA reasoning fallback. |
+| `GROQ_API_KEY` | Enables Groq transcription and optional chat fallback. |
+| `GROQ_FALLBACK_MODEL` | Groq chat model used for tutor fallback. |
+| `GEMINI_API_KEY` | Enables Gemini-based fallback features where configured. |
+| `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` | Enable Supabase-backed storage. |
+| `QDRANT_URL`, `QDRANT_API_KEY` | Configure Qdrant Cloud; otherwise the app may use local Qdrant storage. |
+| `REDIS_URL` | Optional Redis connection. Caching can be disabled if Redis is unavailable. |
+| `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD` | Optional graph indexing. |
+| `CORS_ORIGINS` | Comma-separated browser origins allowed by the API. |
+| `MODEL_*_TIMEOUT_SECONDS` | Bound external model connection and response time. |
+| `MODEL_MAX_RETRIES` | Retry count for transient model errors. |
+
+Model settings can be overridden with environment variables. Restart the API
+after changing `.env`; the running process does not reload configuration
+automatically.
+
+## Run StudySync
+
+Start the API in one PowerShell window:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-## 4. Start Streamlit
+Start the interface in a second PowerShell window:
 
-In a second terminal:
-
-``` powershell
-streamlit run streamlit_app.py
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run streamlit_app.py --server.address 127.0.0.1 --server.port 8501
 ```
 
-UI:
+Open:
 
-``` text
-http://localhost:8501
+- StudySync: <http://127.0.0.1:8501/>
+- API documentation: <http://127.0.0.1:8000/docs>
+- API health: <http://127.0.0.1:8000/health/full>
+
+If the API is not on `http://localhost:8000`, set `API_URL` in the UI process
+environment before starting Streamlit.
+
+## Use the app
+
+### Add a course source
+
+Sign in, open the Study workspace, and upload a PDF, PowerPoint, or lecture
+video. The application extracts available text, builds searchable passages,
+and retains their source locations. For scanned pages, configure Tesseract
+OCR. Image understanding depends on a working configured vision provider.
+
+### Ask the tutor
+
+Ask a question about material in the library. The tutor retrieves matching
+passages and uses citations such as `[1]` to link claims to evidence. Select
+Adaptive, Hints first, or Direct explanation from the tutor controls.
+
+Adaptive behavior uses recent practice history as a rough scaffolding signal.
+For a cold-start learner, it begins with hints-first behavior; this is not a
+validated diagnostic or mastery measure. If a provider fails or returns
+invalid citations, the app safely falls back to the retrieved source excerpt.
+That fallback means model generation did not produce an acceptable cited
+answer; it is not an indication that the source passage is missing.
+
+Audio recordings are transcribed before tutor retrieval. Image input provides
+visual context for retrieval and the grounded tutor response. Uploaded video
+supports timestamped transcript retrieval; video keyframe indexing is not
+currently implemented.
+
+### Practice and dashboard
+
+Practice questions are currently source-passage selection questions. The
+dashboard calculates observed quiz accuracy from correct answers divided by
+answered questions. Uploading a source does not change this value. Sparse
+samples include a Wilson confidence interval to make uncertainty visible.
+
+## API overview
+
+The interactive OpenAPI page at `/docs` is authoritative for request and
+response schemas. Main route groups include:
+
+| Route | Purpose |
+|---|---|
+| `/auth/*` | Registration, login, and account recovery. |
+| `/study/courses` | List the signed-in learner's course library. |
+| `/study/sources` | Upload and list course sources. |
+| `/study/search` | Search indexed source passages. |
+| `/study/tutor` | Request a non-streaming source-grounded response. |
+| `/study/tutor/stream` | Stream a tutor turn and its citation metadata. |
+| `/study/tutor/transcribe` | Transcribe a learner's recorded question. |
+| `/study/conversations` | List saved study conversations. |
+| `/study/quizzes` | Create source-based practice questions. |
+| `/study/progress` | Read source and practice progress. |
+| `/health/full` | Check API and configured service health. |
+
+Protected routes require the bearer token returned by authentication. The
+Streamlit application adds it automatically after sign-in.
+
+## Evaluation
+
+### RAGAS report in the UI
+
+Open **RAGAS evaluation** in the workspace navigation to inspect
+`evals/ragas-report.json`. The view compares faithfulness, answer relevancy,
+context precision, and context recall across available response sets. It also
+shows valid and failed metric counts, model identifiers, and the run status.
+
+The current report is exploratory. Its cases are machine-generated and not
+human-reviewed, and response sets labeled “full pipeline” are not verified
+live runs of the deployed tutor. The displayed scores must not be described as
+human-reviewed benchmark results or proof of compliance.
+
+### Run the evaluator
+
+External RAGAS dependencies are optional and intentionally isolated from the
+application environment:
+
+```powershell
+.\.venv-eval\Scripts\python.exe evals\run_ragas.py --help
 ```
 
-------------------------------------------------------------------------
+See [`evals/README.md`](./evals/README.md) for the complete setup, dataset
+schema, consent gate, baseline-generation process, and evaluation command.
+The external judge sends evaluation questions, answers, references, and
+contexts to the configured provider. Confirm authorization and remove private
+learner data before running it.
 
-# 🔌 API
+The repository also includes `evals/run_benchmark.py` for lexical proxy
+comparisons; these are not RAGAS scores. Synthetic learner simulation is for
+exploring study-policy behavior and is not evidence of real learner outcomes.
 
-  Method    Endpoint                      Purpose
-  --------- ----------------------------- ---------------------------------
-  `POST`    `/auth/register`              Register a user and return JWT
-  `POST`    `/auth/login`                 Authenticate and return JWT
-  `POST`    `/auth/forgot-password`       Start password recovery
-  `POST`    `/auth/reset-password`        Consume a password-reset token
-  `POST`    `/documents/`                 OCR + structured extraction
-  `POST`    `/documents/vlm`              VLM document extraction
-  `POST`    `/multimodal/voice-image`     Audio + optional image workflow
-  `GET`     `/multimodal/conversations`   List user conversations
-  `GET`     `/health/full`                API + Redis health
-  `POST`    `/feedback`                   Submit feedback
-  `GET`     `/feedback/review-queue`      Admin review queue
-  `PATCH`   `/feedback/{id}/review`       Review / resolve feedback
+## Tests and checks
 
-Protected endpoints require:
+Run all automated tests from the project root:
 
-``` http
-Authorization: Bearer <JWT>
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
-------------------------------------------------------------------------
+GitHub Actions runs this test suite on pushes to `main` and pull requests.
+The workflow needs no cloud or model credentials.
 
-# 🧪 Evaluation & Quality Gates
+Run a focused test file:
 
-The project includes a **versioned offline evaluation suite** designed
-to prevent prompt/model regressions from reaching production unnoticed.
-
-## Run the evaluator
-
-Create a response map:
-
-``` powershell
-@'
-{
-  "invoice-total-001": "The invoice total is 125 dollars.",
-  "uncertain-001": "The missing information is the due date."
-}
-'@ | Set-Content evals/responses.json
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\test_study_tutor_stream.py -q
 ```
 
-Run:
+Apply migrations after updating the code:
 
-``` powershell
-.\doc-intell\Scripts\python.exe evals/run_offline.py evals/responses.json
+```powershell
+.\.venv\Scripts\alembic.exe upgrade head
 ```
 
-The evaluator:
+## Known limits
 
-1.  Loads versioned golden cases.
-2.  Scores candidate responses.
-3.  Calculates the regression pass rate.
-4.  Compares the result against the configured threshold.
-5.  Returns a non-zero exit code when the quality gate fails.
+- Course-source ingestion currently processes uploads synchronously and is
+  limited to 25 MB. Resumable background jobs and large-course throughput have
+  not been demonstrated.
+- Video transcripts are indexed with timestamps, but keyframe extraction and
+  indexing are not implemented.
+- Assessment currently focuses on source-passage selection; a full exam
+  blueprint, numerical grading, short-answer rubric grading, and cited
+  post-exam reports remain future work.
+- Topic practice signals are heuristic and are not calibrated measures of
+  student competence.
+- The saved RAGAS candidate dataset has not been human-reviewed. The reported
+  baselines are exploratory and do not represent verified production runs.
+- Accessibility, mobile behavior, production load, and latency targets require
+  additional measurement before making claims about them.
 
-### Recommended production lifecycle
+## Troubleshooting
 
-``` text
-Prompt / Model Change
-        │
-        ▼
-Offline Evaluation
-        │
-   ┌────┴────┐
-   │         │
- FAIL       PASS
-   │         │
- STOP       ▼
-          Deploy
-            │
-            ▼
-      Online Monitoring
-            │
-            ▼
-      User Feedback
-            │
-            ▼
-       Human Review
-            │
-            ▼
-      Improve + Re-evaluate
+### The tutor says the model is unavailable
+
+The tutor displays a source excerpt when every configured model fails or
+returns an answer with invalid citations. Check the API process logs for
+provider and error type, then verify:
+
+1. `NVIDIA_API_KEY` is valid and has access to the selected model.
+2. `NVIDIA_PRIMARY_MODEL` and `NVIDIA_FALLBACK_MODEL` are enabled in the
+   provider account.
+3. `GROQ_API_KEY` is valid if relying on Groq as an additional fallback.
+4. The API was restarted after editing `.env`.
+5. The provider is not returning quota, availability, or rate-limit errors.
+
+Never print or share the secret key when debugging. A valid key cannot prevent
+temporary provider overload; configure a second working model/provider.
+
+### Retrieval returns no relevant passage
+
+Confirm the source appears in **My library**, wait for its upload request to
+finish, and search for a distinctive phrase from the material. Verify that
+PostgreSQL is reachable and inspect API logs for Qdrant errors. Lexical
+retrieval can continue if vector search is unavailable, but it may return
+different results.
+
+### Redis, Neo4j, or Qdrant is unavailable
+
+These services are optional for some local workflows. Check `/health/full`
+and confirm the matching connection settings. Redis cache unavailability
+does not itself indicate that PostgreSQL or tutor providers are unavailable.
+Local Qdrant storage is used when cloud Qdrant is not configured.
+
+## Repository map
+
+```text
+app/
+  api/                 FastAPI routers and workflow endpoints
+  dependencies/        Authentication and request dependencies
+  models/              Database models
+  schemas/             Request and response validation
+  services/            Ingestion, retrieval, tutoring, AI providers
+alembic/               Database migrations
+evals/                 RAGAS, smoke tests, and benchmark tooling
+tests/                 Automated test suite
+streamlit_app.py       StudySync learner interface
+requirements.txt       Application dependencies
+.env.example           Safe configuration template
+docker-compose.yml     Local container orchestration
 ```
 
-------------------------------------------------------------------------
-
-# 🛡️ AI Safety
-
-The multimodal pipeline applies defense-in-depth checks before model
-execution.
-
-## Prompt injection
-
-Inputs are checked for common instruction-override patterns designed to
-manipulate the model's system behavior.
-
-## Credential exfiltration
-
-Inputs are checked for common attempts to obtain:
-
--   API keys
--   passwords
--   secrets
--   credentials
--   internal configuration
-
-## Important security principle
-
-These checks are **not a complete security boundary**.
-
-Production security should also include:
-
--   provider-side safety controls
--   strict outbound network policies
--   secret isolation
--   redaction
--   authentication and authorization
--   resource ownership checks
--   least-privilege credentials
--   human review for sensitive cases
--   audit logging
-
-------------------------------------------------------------------------
-
-# 👤 Human Review & Feedback
-
-Users can submit feedback on model responses.
-
-Administrators can access the review queue and resolve submitted
-feedback.
-
-This creates a continuous improvement loop:
-
-``` text
-User
- │
- ▼
-AI Response
- │
- ├── 👍 Positive
- │
- └── 👎 Negative
-       │
-       ▼
-   Review Queue
-       │
-       ▼
- Human Review
-       │
-       ▼
- Prompt / Model / Safety Improvement
-```
-
-------------------------------------------------------------------------
-
-# 📊 Online Evaluation
-
-Online LLM-as-judge evaluation is **disabled by default** and is
-designed to fail open.
-
-Enable it with:
-
-``` env
-ONLINE_EVAL_ENABLED=true
-ONLINE_EVAL_SAMPLE_RATE=1.0
-OPENAI_API_KEY=replace-me
-```
-
-Evaluation metadata is written to the append-only audit log.
-
-Raw prompts and model responses are not stored with evaluation records.
-
-Administrators can inspect recent evaluation records through:
-
-``` text
-GET /monitoring/evaluations
-```
-
-------------------------------------------------------------------------
-
-# 🔬 Testing
-
-Run the complete automated test suite:
-
-``` powershell
-.\doc-intell\Scripts\python.exe -m pytest -q
-```
-
-Tests mock external provider calls, so they do not validate live
-credentials.
-
-> ⚠️ Live provider smoke tests should be executed intentionally because
-> they consume provider quota.
-
-------------------------------------------------------------------------
-
-# 🐳 Docker
-
-The project uses separate containers for the API and Streamlit UI.
-
-``` text
-Dockerfile.api  → FastAPI
-Dockerfile.ui   → Streamlit
-```
-
-For a pull-only runtime stack:
-
-``` bash
-docker compose pull
-docker compose up -d --no-build
-docker compose ps
-```
-
-The runtime should consume pre-built images rather than building
-production images on the server.
-
-------------------------------------------------------------------------
-
-# 🔄 CI/CD
-
-Production images are built by **GitHub Actions**, not on the production
-runtime.
-
-``` text
-Developer
-    │
-    │ git push
-    ▼
-GitHub
-    │
-    ▼
-GitHub Actions
-    │
-    ├── Run tests
-    │
-    ├── Build API image
-    ├── Build UI image
-    │
-    ▼
-Amazon ECR
-    │
-    ▼
-Amazon ECS
-    │
-    ▼
-Application Load Balancer
-    │
-    ├── :8501 → Streamlit
-    │
-    └── :8000 → FastAPI
-```
-
-### Deployment principle
-
-Production servers **pull immutable build artifacts** rather than
-building application images themselves.
-
-The deployment workflow can publish images using:
-
--   `latest`
--   commit SHA
-
-The commit SHA provides an exact deployment artifact and makes
-rollback/debugging easier.
-
-------------------------------------------------------------------------
-
-# ☁️ AWS Production Architecture
-
-The production deployment uses:
-
--   **Amazon ECR** --- container image registry
--   **Amazon ECS** --- container orchestration
--   **Application Load Balancer** --- HTTP routing
--   **Security Groups** --- network access control
--   **CloudWatch** --- application/container logs
-
-The API and UI run as separate services.
-
-``` text
-                         Internet
-                            │
-                            ▼
-                 ┌─────────────────────┐
-                 │ Application Load     │
-                 │ Balancer             │
-                 └──────────┬──────────┘
-                            │
-              ┌─────────────┴─────────────┐
-              │                           │
-              ▼                           ▼
-        Streamlit :8501              FastAPI :8000
-              │                           │
-              │                     ┌─────┴─────┐
-              │                     │           │
-              ▼                     ▼           ▼
-             UI                  Database     Redis
-                                    │
-                                    ▼
-                              AI / Storage
-```
-
-### Long-running multimodal requests
-
-Multimodal inference can involve several upstream AI calls, particularly
-when speech generation is included.
-
-The production ALB idle timeout should therefore be configured with
-enough headroom for the application-level Gemini timeout.
-
-Current application behavior uses a **120-second TTS request timeout**.
-
-A small additional ALB timeout margin is recommended so the gateway does
-not terminate a request at exactly the same moment as the application
-timeout.
-
-------------------------------------------------------------------------
-
-# 🔐 Production Security Checklist
-
-Before exposing the application publicly:
-
--   [ ] Use strong JWT secrets.
--   [ ] Keep all provider keys outside Git.
--   [ ] Use production-grade PostgreSQL.
--   [ ] Use managed Redis where appropriate.
--   [ ] Restrict `CORS_ORIGINS`.
--   [ ] Never use `CORS_ORIGINS=*` in production.
--   [ ] Enforce authentication on protected endpoints.
--   [ ] Enforce resource ownership.
--   [ ] Keep administrator routes restricted.
--   [ ] Use least-privilege cloud credentials.
--   [ ] Enable TLS/HTTPS at the public edge.
--   [ ] Configure database backups.
--   [ ] Monitor application and infrastructure health.
--   [ ] Run offline evaluation before model/prompt rollout.
--   [ ] Keep an audit trail for security-sensitive operations.
--   [ ] Review prompt-injection and data-exfiltration defenses
-    regularly.
-
-------------------------------------------------------------------------
-
-# 🩺 Health & Operations
-
-Health endpoint:
-
-``` text
-GET /health/full
-```
-
-Use it to verify API and Redis availability.
-
-For production incidents, inspect:
-
-1.  Application logs
-2.  ECS task health
-3.  ALB target health
-4.  CloudWatch logs
-5.  Database connectivity
-6.  Redis connectivity
-7.  Provider availability
-8.  Request latency and gateway timeouts
-
-------------------------------------------------------------------------
-
-# 📈 Observability
-
-The application is designed around observable AI workflows.
-
-``` text
-User Request
-     │
-     ▼
-FastAPI
-     │
-     ├── Auth trace
-     ├── Retrieval / processing trace
-     ├── VLM trace
-     ├── STT trace
-     ├── Gemini reasoning trace
-     ├── TTS trace
-     │
-     ▼
-LangSmith
-     │
-     ▼
-Evaluation / Feedback
-```
-
-Tracing helps identify whether latency or failures originate from:
-
--   application code
--   database
--   Redis
--   AI provider
--   TTS
--   network/gateway infrastructure
-
-------------------------------------------------------------------------
-
-# 🧱 Reliability Principles
-
-This project follows several production-oriented principles:
-
-### 1. Fail explicitly
-
-Provider failures should surface as controlled application errors rather
-than silently producing incorrect output.
-
-### 2. Validate at boundaries
-
-Validate:
-
--   authentication
--   file types
--   request payloads
--   model responses
--   structured JSON
--   ownership
--   configuration
-
-### 3. Keep secrets out of source control
-
-Production credentials belong in environment configuration or a secrets
-manager.
-
-### 4. Evaluate before deployment
-
-Prompt and model changes should pass the offline regression suite before
-production rollout.
-
-### 5. Observe after deployment
-
-Passing tests is not enough. Production behavior must be monitored
-through traces, health checks, feedback, and evaluation.
-
-### 6. Separate build from runtime
-
-CI builds the artifacts. Production pulls and runs those artifacts.
-
-------------------------------------------------------------------------
-
-# 🗺️ Recommended Development Workflow
-
-``` text
-1. Build feature
-      │
-      ▼
-2. Write / update tests
-      │
-      ▼
-3. Run pytest
-      │
-      ▼
-4. Run offline evaluation
-      │
-      ▼
-5. Review safety implications
-      │
-      ▼
-6. Commit + push
-      │
-      ▼
-7. GitHub Actions
-      │
-      ▼
-8. Build + publish image
-      │
-      ▼
-9. Deploy to ECS
-      │
-      ▼
-10. Verify health
-      │
-      ▼
-11. Test production workflow
-      │
-      ▼
-12. Monitor LangSmith / CloudWatch
-```
-
-------------------------------------------------------------------------
-
-# 🎯 Project Goals
-
-This project demonstrates how to move beyond a simple AI prototype
-toward a **production multimodal AI system** with:
-
--   asynchronous APIs
--   authentication and authorization
--   persistent storage
--   caching
--   multimodal inference
--   speech processing
--   structured extraction
--   model observability
--   offline evaluation
--   LLM-as-judge evaluation
--   human review
--   AI safety controls
--   automated testing
--   containerization
--   CI/CD
--   AWS deployment
--   operational health monitoring
-
-------------------------------------------------------------------------
-
-# 🏁 Quick Start
-
-``` powershell
-# Install
-pip install -r requirements.txt
-
-# Database migrations
-alembic upgrade head
-
-# API
-uvicorn app.main:app --reload
-
-# UI
-streamlit run streamlit_app.py
-```
-
-Then open:
-
-``` text
-UI       → http://localhost:8501
-API      → http://localhost:8000
-Swagger  → http://localhost:8000/docs
-```
-
-------------------------------------------------------------------------
-
-# 📌 Production Notes
-
-For a serious production deployment:
-
--   Prefer managed PostgreSQL such as RDS or Supabase.
--   Prefer managed Redis such as ElastiCache or an equivalent managed
-    service.
--   Put HTTPS/TLS in front of public services.
--   Restrict CORS to the real frontend origin.
--   Maintain automated database backups.
--   Use Alembic for schema evolution.
--   Keep provider credentials in a secrets manager where possible.
--   Use exact image versions/commit SHAs for controlled releases.
--   Monitor ALB, ECS, application, database, Redis, and provider
-    latency.
--   Run regression evaluation before changing production prompts or
-    models.
-
-------------------------------------------------------------------------
-
-## 📚 Summary
-
-**Document Intelligence** combines document AI, computer vision, speech,
-multimodal reasoning, structured extraction, safety, evaluation,
-observability, and cloud deployment into one production-oriented system.
-
-It is intentionally designed not just to **call an AI model**, but to
-demonstrate the engineering layers required to operate AI reliably in
-production.
-
-> **AI is the intelligence layer. Production engineering is what makes
-> that intelligence usable, observable, secure, and reliable.**
-
-------------------------------------------------------------------------
-
-## 👨‍💻 Project Status
-
-**Production-ready deployment completed.**
-
-Core platform:
-
--   ✅ FastAPI API
--   ✅ Streamlit UI
--   ✅ JWT authentication
--   ✅ PostgreSQL
--   ✅ Redis
--   ✅ Supabase Storage
--   ✅ NVIDIA VLM
--   ✅ Groq STT
--   ✅ NvidiaNemotrone multimodal reasoning
--   ✅ Gemini TTS
--   ✅ LangSmith observability
--   ✅ Offline evaluation
--   ✅ Human review
--   ✅ AI safety checks
--   ✅ Automated testing
--   ✅ Docker
--   ✅ GitHub Actions CI/CD
--   ✅ Amazon ECR
--   ✅ Amazon ECS
--   ✅ Application Load Balancer
-
-------------------------------------------------------------------------
-
-```{=html}
-<p align="center">
-```
-**Built as a production-oriented multimodal AI system.**
-
-```{=html}
-</p>
-```
+## License and data
+
+Review the repository's license and the licenses of course materials before
+redistributing or sending content to external model providers. Keep API
+credentials and private learner data out of source control and evaluation
+fixtures.

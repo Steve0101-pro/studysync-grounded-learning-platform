@@ -23,46 +23,21 @@ from app.services.online_eval import evaluate_response
 from app.services.audit import record_audit
 from app.config import settings
 from app.rate_limit import limiter, RATE_LIMIT_MULTIMODAL
+from app.services.media_validation import (
+    ALLOWED_AUDIO_TYPES,
+    ALLOWED_IMAGE_TYPES,
+    MAX_MULTIMODAL_FILE_SIZE,
+    has_valid_media_signature as _has_valid_signature,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/multimodal", tags=["Multimodal"])
 
-# Content-type validation boundaries
-ALLOWED_AUDIO_TYPES = {
-    "audio/mpeg", "audio/mp3", "audio/mp4", "audio/m4a",
-    "audio/wav", "audio/x-wav", "audio/ogg", "audio/webm",
-}
-
-ALLOWED_IMAGE_TYPES = {
-    "image/jpeg", "image/jpg", "image/png", "image/webp"
-}
-
-MAX_MULTIMODAL_FILE_SIZE = 25 * 1024 * 1024
-
 
 def _normalize_cache_text(value: str | None) -> str:
     """Normalize user-entered prompts so harmless whitespace changes still hit cache."""
     return " ".join((value or "").split()).casefold()
-
-
-def _has_valid_signature(file_bytes: bytes, content_type: str) -> bool:
-    """Reject payloads whose magic bytes do not match their declared media type."""
-    signatures = {
-        "audio/mpeg": file_bytes.startswith((b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")),
-        "audio/mp3": file_bytes.startswith((b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")),
-        "audio/wav": file_bytes.startswith(b"RIFF") and file_bytes[8:12] == b"WAVE",
-        "audio/x-wav": file_bytes.startswith(b"RIFF") and file_bytes[8:12] == b"WAVE",
-        "audio/ogg": file_bytes.startswith(b"OggS"),
-        "audio/webm": file_bytes.startswith(b"\x1a\x45\xdf\xa3"),
-        "audio/mp4": b"ftyp" in file_bytes[:16],
-        "audio/m4a": b"ftyp" in file_bytes[:16],
-        "image/jpeg": file_bytes.startswith(b"\xff\xd8\xff"),
-        "image/jpg": file_bytes.startswith(b"\xff\xd8\xff"),
-        "image/png": file_bytes.startswith(b"\x89PNG\r\n\x1a\n"),
-        "image/webp": file_bytes.startswith(b"RIFF") and file_bytes[8:12] == b"WEBP",
-    }
-    return signatures.get(content_type, False)
 
 
 @router.get("/conversations")
@@ -136,10 +111,10 @@ async def voice_image_pipeline(
                 status_code=400,
                 detail="Image file payload is empty",
             )
-            if len(image_bytes) > MAX_MULTIMODAL_FILE_SIZE:
-                raise HTTPException(status_code=413, detail="Image file exceeds the 25MB limit")
-            if not _has_valid_signature(image_bytes, image.content_type):
-                raise HTTPException(status_code=400, detail="Image content does not match its declared type")
+        if len(image_bytes) > MAX_MULTIMODAL_FILE_SIZE:
+            raise HTTPException(status_code=413, detail="Image file exceeds the 25MB limit")
+        if not _has_valid_signature(image_bytes, image.content_type):
+            raise HTTPException(status_code=400, detail="Image content does not match its declared type")
         image_content_type = image.content_type
 
     # ----------------------------------------------------------------
@@ -276,7 +251,7 @@ async def voice_image_pipeline(
             "status": evaluation["status"],
             "scores": evaluation.get("scores"),
             "variant": experiment_variant,
-            "model_version": settings.NVIDIA_PRIMARY_MODEL,
+            "model_version": settings.GEMINI_MODEL,
             "prompt_version": settings.PROMPT_VERSION,
         },
     )
@@ -289,7 +264,7 @@ async def voice_image_pipeline(
                 conversation_id=conversation.id,
                 rating=None,
                 comment="Automatically escalated by online evaluation.",
-                model_version=settings.NVIDIA_PRIMARY_MODEL,
+                model_version=settings.GEMINI_MODEL,
                 prompt_version=settings.PROMPT_VERSION,
                 review_status="escalated",
             )

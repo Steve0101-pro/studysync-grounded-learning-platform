@@ -1,0 +1,637 @@
+import base64
+import uuid
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
+
+from app.api.study import router as study_router
+from app.api.auth import router as auth_router
+from app.database import get_db
+from app.dependencies.auth import get_current_user
+from app.rate_limit import setup_rate_limiting
+from app.services import study_orchestration
+from app.api import study as study_api
+from app.services.study_materials import rank_content
+from app.services.learning.mastery import estimate_mastery, recommended_review_days
+from app.services.learning.analytics import practice_accuracy_chart, wilson_interval
+from app.services.learning.retrieval import bm25_scores, fuse_bm25_and_cosine
+from app.services.study_orchestration import _has_valid_citations
+from app.api.learning.courses import router as courses_router
+from app.api.learning import (
+    assessments_router,
+    dashboard_router,
+    sources_router,
+    tutor_router,
+)
+
+app = FastAPI()
+setup_rate_limiting(app)
+app.include_router(study_router)
+app.include_router(courses_router)
+app.include_router(auth_router)
+
+
+class _Result:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+
+class _StudyDatabase:
+    def __init__(
+        self,
+        rows,
+        source_count=0,
+        mastery_events=None,
+        used_passages=None,
+        source=None,
+    ):
+        self.rows = rows
+        self.question = None
+        self.source_count = source_count
+        self.mastery_events = mastery_events or []
+        self.used_passages = used_passages or []
+        self.source = source
+
+    async def execute(self, statement):
+        query = str(statement)
+        if "answered_at" in query:
+            return _Result(self.mastery_events)
+        if "study_quiz_questions" in query and "source_id" in query:
+            return _Result(self.used_passages)
+        return _Result(self.rows)
+
+    def add(self, question):
+        self.question = question
+        self.used_passages.append(
+            (
+                question.source_id,
+                question.location_type,
+                question.location_number,
+            )
+        )
+
+    async def commit(self):
+        return None
+
+    async def refresh(self, question):
+        if question.id is None:
+            question.id = uuid.uuid4()
+
+    async def scalar(self, statement):
+        if "study_sources" in str(statement):
+            return self.source if self.source is not None else self.source_count
+        return self.source_count or self.question
+
+
+def _passage(source_id: uuid.UUID, filename: str, location_number: int, content: str):
+    source = SimpleNamespace(id=source_id, filename=filename, user_id=uuid.uuid4())
+    unit = SimpleNamespace(
+        id=uuid.uuid4(),
+        source_id=source_id,
+        location_type="page",
+        location_number=location_number,
+        chunk_index=0,
+        content=content,
+    )
+    return unit, source
+
+
+@pytest.mark.asyncio
+async def test_study_tutor_returns_only_cited_source_text_and_flags_gaps(monkeypatch):
+    user_id = uuid.uuid4()
+    rows = [
+        _passage(uuid.uuid4(), "biology.pdf", 2, "Mitochondria produce ATP during respiration."),
+        _passage(uuid.uuid4(), "biology.pdf", 3, "The cell membrane controls transport."),
+    ]
+    database = _StudyDatabase(rows)
+    monkeypatch.setattr(
+        study_api,
+        "search_study_passages",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("Qdrant unavailable")),
+    )
+    monkeypatch.setattr(study_orchestration, "_model_providers", lambda: [])
+
+    async def override_db():
+        yield database
+
+    app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=user_id)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            grounded = await client.get("/study/tutor", params={"q": "mitochondria ATP"})
+            uncovered = await client.get("/study/tutor", params={"q": "quantum mechanics"})
+
+        assert grounded.status_code == 200
+        grounded_payload = grounded.json()
+        assert grounded_payload["grounded"] is True
+        assert grounded_payload["retrieval_backend"] == "bm25"
+        assert grounded_payload["generation_provider"] == "source_excerpt"
+        assert grounded_payload["citations"][0]["filename"] == "biology.pdf"
+        assert grounded_payload["citations"][0]["location_number"] == 2
+        assert grounded_payload["citations"][0]["content"] in grounded_payload["answer"]
+        assert uncovered.status_code == 200
+        assert uncovered.json()["grounded"] is False
+        assert uncovered.json()["citations"] == []
+        assert uncovered.json()["generation_provider"] == "none"
+        assert "couldn't find" in uncovered.json()["answer"]
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_study_tutor_uses_fallback_model_after_primary_failure(monkeypatch):
+    async def retrieve(_query):
+        return (
+            [
+                {
+                    "source_id": str(uuid.uuid4()),
+                    "filename": "biology.pdf",
+                    "location_type": "page",
+                    "location_number": 3,
+                    "content": "Mitochondria produce ATP.",
+                }
+            ],
+            "qdrant",
+        )
+
+    providers = [
+        ("NVIDIA", "https://example.test/v1", "primary-test-key", "primary-model"),
+        ("Groq", "https://example.test/v1", "fallback-test-key", "fallback-model"),
+    ]
+    monkeypatch.setattr(study_orchestration, "_model_providers", lambda: providers)
+    calls = []
+
+    class _Completion:
+        async def create(self, **_kwargs):
+            calls.append(self.provider)
+            if self.provider == "NVIDIA":
+                raise RuntimeError("primary unavailable")
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="Mitochondria make ATP [1]."))]
+            )
+
+    class _Client:
+        def __init__(self, *, api_key, **_kwargs):
+            self.provider = "NVIDIA" if api_key == "primary-test-key" else "Groq"
+            completion = _Completion()
+            completion.provider = self.provider
+            self.chat = SimpleNamespace(completions=completion)
+
+    monkeypatch.setattr(study_orchestration, "AsyncOpenAI", _Client)
+    result = await study_orchestration.run_study_tutor("mitochondria", retrieve)
+
+    assert calls == ["NVIDIA", "Groq"]
+    assert result["generation_provider"] == "groq"
+    assert "ATP [1]" in result["answer"]
+
+
+@pytest.mark.asyncio
+async def test_study_quiz_hides_answer_records_response_and_blocks_second_attempt():
+    topic = "mitochondria ATP"
+    user_id = uuid.uuid4()
+    rows = [
+        _passage(uuid.uuid4(), "biology.pdf", 2, "Mitochondria produce ATP during respiration."),
+        _passage(uuid.uuid4(), "biology.pdf", 5, "ATP is synthesized in the mitochondrial membrane."),
+        _passage(uuid.uuid4(), "biology.pdf", 3, "The cell membrane controls transport."),
+        _passage(uuid.uuid4(), "biology.pdf", 4, "Ribosomes assemble proteins."),
+    ]
+    rows.sort(key=lambda row: -rank_content(topic, row[0].content))
+    database = _StudyDatabase(rows)
+
+    async def override_db():
+        yield database
+
+    app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=user_id)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            created = await client.post("/study/quizzes", json={"topic": topic})
+            assert created.status_code == 201
+            payload = created.json()
+            assert len(payload["options"]) == 3
+            assert "answer_index" not in payload
+            assert all("location_number" in option for option in payload["options"])
+
+            correct_index = database.question.answer_index
+            wrong_index = (correct_index + 1) % len(payload["options"])
+            answered = await client.post(
+                f"/study/quizzes/{payload['id']}/answer",
+                json={"selected_index": wrong_index},
+            )
+            assert answered.status_code == 200
+            assert answered.json()["correct"] is False
+            assert answered.json()["answered_index"] == wrong_index
+            assert answered.json()["explanation"] == payload["options"][correct_index]
+
+            replay = await client.post(
+                f"/study/quizzes/{payload['id']}/answer",
+                json={"selected_index": correct_index},
+            )
+            assert replay.status_code == 409
+
+            first_source = database.question.source_id
+            second = await client.post("/study/quizzes", json={"topic": topic})
+            assert second.status_code == 201
+            assert database.question.source_id != first_source
+
+            exhausted = await client.post("/study/quizzes", json={"topic": topic})
+            assert exhausted.status_code == 409
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_source_open_returns_short_lived_page_deep_link(monkeypatch):
+    source = SimpleNamespace(
+        id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        filename="biology.pdf",
+        content_type="application/pdf",
+        storage_path="private/biology.pdf",
+        page_count=12,
+    )
+    database = _StudyDatabase([], source=source)
+    monkeypatch.setattr(
+        study_api,
+        "create_signed_url",
+        lambda path, expiry: (
+            f"https://storage.example.test/{path}?expires={expiry}"
+        ),
+    )
+
+    async def override_db():
+        yield database
+
+    app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=source.user_id)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get(
+                f"/study/sources/{source.id}/open",
+                params={"location_type": "page", "location_number": 7},
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "url": "https://storage.example.test/private/biology.pdf?expires=300#page=7",
+            "expires_in_seconds": 300,
+            "viewer_supported": True,
+            "location_type": "page",
+            "location_number": 7,
+        }
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_powerpoint_slide_viewer_returns_owner_scoped_text_and_images(monkeypatch):
+    source = SimpleNamespace(
+        id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        filename="course.pptx",
+        content_type=study_api.PPTX_CONTENT_TYPE,
+        storage_path="private/course.pptx",
+        page_count=4,
+    )
+    database = _StudyDatabase([], source=source)
+    monkeypatch.setattr(study_api, "download_file", lambda path: b"presentation")
+    monkeypatch.setattr(
+        study_api,
+        "_pptx_slides",
+        lambda file_bytes: [(3, "Gradient descent updates model parameters.", [b"raw-image"])],
+    )
+    monkeypatch.setattr(study_api, "_prepare_figure_image", lambda image: b"jpeg-preview")
+
+    async def override_db():
+        yield database
+
+    app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=source.user_id)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get(f"/study/sources/{source.id}/slides/3")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["filename"] == "course.pptx"
+        assert payload["slide_number"] == 3
+        assert payload["slide_count"] == 4
+        assert payload["text"] == "Gradient descent updates model parameters."
+        assert payload["images"] == [
+            {
+                "media_type": "image/jpeg",
+                "data": base64.b64encode(b"jpeg-preview").decode("ascii"),
+            }
+        ]
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_powerpoint_slide_viewer_hides_sources_from_other_users(monkeypatch):
+    source = SimpleNamespace(
+        id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        filename="course.pptx",
+        content_type=study_api.PPTX_CONTENT_TYPE,
+        storage_path="private/course.pptx",
+        page_count=4,
+    )
+
+    class _MissingSourceDatabase:
+        async def scalar(self, _statement):
+            return None
+
+    async def override_db():
+        yield _MissingSourceDatabase()
+
+    app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=uuid.uuid4())
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get(f"/study/sources/{source.id}/slides/3")
+
+        assert response.status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_study_progress_reports_answer_accuracy_per_topic():
+    user_id = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    mastery_events = [
+        ("cell biology", True, now - timedelta(days=2)),
+        ("cell biology", False, now - timedelta(days=1)),
+        ("cell biology", True, now),
+    ]
+    database = _StudyDatabase(
+        [
+            ("cell biology", 4, 3, 2),
+            ("genetics", 2, 0, 0),
+        ],
+        source_count=2,
+        mastery_events=mastery_events,
+    )
+
+    async def override_db():
+        yield database
+
+    app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=user_id)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/study/progress")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "total_sources": 2,
+            "total_questions": 6,
+            "answered_questions": 3,
+            "correct_answers": 2,
+            "practice_accuracy": pytest.approx(2 / 3),
+            "topics": [
+                {
+                    "topic": "cell biology",
+                    "answered": 3,
+                    "correct": 2,
+                    "accuracy": pytest.approx(2 / 3),
+                    "mastery_estimate": pytest.approx(
+                        estimate_mastery(
+                            [(correct, answered_at) for _, correct, answered_at in mastery_events],
+                            as_of=now,
+                        )
+                    ),
+                    "recommended_review_in_days": recommended_review_days(
+                        estimate_mastery(
+                            [(correct, answered_at) for _, correct, answered_at in mastery_events],
+                            as_of=now,
+                        )
+                    ),
+                },
+                {
+                    "topic": "genetics",
+                    "answered": 0,
+                    "correct": 0,
+                    "accuracy": 0.0,
+                    "mastery_estimate": 0.2,
+                    "recommended_review_in_days": None,
+                },
+            ],
+        }
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_wilson_accuracy_interval_exposes_uncertainty_for_small_samples():
+    single_correct_interval = wilson_interval(1, 1)
+    larger_sample_interval = wilson_interval(80, 100)
+
+    assert single_correct_interval == pytest.approx((0.2065, 1.0), abs=0.001)
+    assert larger_sample_interval is not None
+    assert larger_sample_interval[0] < 0.8 < larger_sample_interval[1]
+    assert wilson_interval(0, 0) is None
+    with pytest.raises(ValueError, match="0 <= correct <= answered"):
+        wilson_interval(2, 1)
+
+
+def test_practice_accuracy_chart_shows_attempted_topics_and_confidence_range():
+    chart = practice_accuracy_chart(
+        [
+            {
+                "topic": "one correct answer",
+                "answered": 1,
+                "correct": 1,
+                "accuracy": 1.0,
+            },
+            {
+                "topic": "not attempted",
+                "answered": 0,
+                "correct": 0,
+                "accuracy": 0.0,
+            },
+        ]
+    )
+
+    assert chart is not None
+    chart_spec = chart.to_dict()
+    assert chart_spec["layer"][0]["encoding"]["x"]["field"] == "lower"
+    assert chart_spec["layer"][0]["encoding"]["x2"]["field"] == "upper"
+    assert chart_spec["layer"][1]["encoding"]["x"]["field"] == "accuracy"
+    assert chart_spec["data"]["values"][0]["answered"] == 1
+    assert chart_spec["data"]["values"][0]["lower"] == pytest.approx(0.2065, abs=0.001)
+    assert practice_accuracy_chart(
+        [{"topic": "not attempted", "answered": 0, "correct": 0, "accuracy": 0.0}]
+    ) is None
+
+
+def test_mastery_estimate_uses_response_and_forgets_over_time():
+    now = datetime.now(timezone.utc)
+    recent_correct = [(True, now)]
+    recent_incorrect = [(False, now)]
+
+    assert estimate_mastery(recent_correct, as_of=now) > estimate_mastery(
+        recent_incorrect, as_of=now
+    )
+    assert estimate_mastery(recent_correct, as_of=now + timedelta(days=84)) < estimate_mastery(
+        recent_correct, as_of=now
+    )
+    assert recommended_review_days(0.3) < recommended_review_days(0.8)
+
+
+def test_bm25_and_cosine_hybrid_ranking_prefers_lexical_and_semantic_evidence():
+    documents = [
+        "Mitochondria generate cellular energy through respiration.",
+        "The cell membrane regulates transport across the cell.",
+        "Mitochondria mitochondria mitochondria produce energy.",
+    ]
+    lexical_scores = bm25_scores("mitochondria energy", documents)
+    assert lexical_scores[2] > lexical_scores[0] > lexical_scores[1]
+
+    combined = fuse_bm25_and_cosine(lexical_scores, [0.72, 0.98, 0.35])
+    assert combined[0] > combined[1]
+    assert combined[2] > combined[1]
+
+
+def test_hybrid_retrieval_rejects_mismatched_score_lists():
+    with pytest.raises(ValueError, match="same length"):
+        fuse_bm25_and_cosine([1.0], [])
+
+
+def test_tutor_requires_citations_on_each_response_line():
+    assert _has_valid_citations("Respiration releases energy [1].\nATP is produced [2].", 2)
+    assert not _has_valid_citations("Respiration releases energy [3].", 2)
+    assert not _has_valid_citations("Respiration releases energy [1].\nATP is produced.", 2)
+    assert _has_valid_citations(
+        "Big data means varied sources [1].\n\n"
+        "**Check-for-understanding:**\n"
+        "Would millions of same-type records from one source qualify? Why?",
+        1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retrieval_combines_bm25_and_qdrant_cosine(monkeypatch):
+    user_id = uuid.uuid4()
+    lexical_source_id = uuid.uuid4()
+    semantic_source_id = uuid.uuid4()
+    rows = [
+        _passage(
+            lexical_source_id,
+            "biology.pdf",
+            1,
+            "Mitochondria produce ATP during cellular respiration.",
+        ),
+        _passage(
+            semantic_source_id,
+            "biology.pdf",
+            2,
+            "Energy conversion occurs in the organelle membrane.",
+        ),
+    ]
+    database = _StudyDatabase(rows)
+    monkeypatch.setattr(
+        study_api,
+        "search_study_passages",
+        lambda *_args: [
+            {
+                "source_id": str(semantic_source_id),
+                "filename": "biology.pdf",
+                "location_type": "page",
+                "location_number": 2,
+                "chunk_index": 0,
+                "content": "Energy conversion occurs in the organelle membrane.",
+                "score": 0.91,
+            }
+        ],
+    )
+
+    passages, backend = await study_api._hybrid_retrieve_study_passages(
+        database, user_id, "mitochondria ATP", 5
+    )
+
+    assert backend == "bm25+cosine"
+    assert len(passages) == 2
+    assert passages[0]["location_number"] == 1
+    assert passages[0]["bm25_score"] > 0
+    assert passages[1]["cosine_score"] == pytest.approx(0.91)
+
+
+def test_learning_api_is_split_by_user_workflow():
+    routers = {
+        "sources": sources_router,
+        "tutor": tutor_router,
+        "assessments": assessments_router,
+        "dashboard": dashboard_router,
+    }
+    expected_paths = {
+        "sources": {
+            "/study/sources",
+            "/study/sources/{source_id}/open",
+            "/study/sources/{source_id}/slides/{slide_number}",
+        },
+        "tutor": {
+            "/study/search",
+            "/study/tutor",
+            "/study/tutor/transcribe",
+            "/study/tutor/stream",
+            "/study/conversations",
+            "/study/conversations/{conversation_id}/messages",
+        },
+        "assessments": {"/study/quizzes", "/study/quizzes/{question_id}/answer"},
+        "dashboard": {"/study/progress"},
+    }
+    for name, router in routers.items():
+        assert {route.path for route in router.routes} == expected_paths[name]
+
+
+@pytest.mark.asyncio
+async def test_login_reports_database_outage_as_service_unavailable():
+    from sqlalchemy.exc import OperationalError
+
+    class _UnavailableDatabase:
+        async def execute(self, _statement):
+            raise OperationalError("SELECT", {}, RuntimeError("database unavailable"))
+
+    async def override_db():
+        yield _UnavailableDatabase()
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/auth/login",
+                json={"email": "student@example.com", "password": "StrongPass123"},
+            )
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Authentication service is temporarily unavailable"
+    finally:
+        app.dependency_overrides.clear()

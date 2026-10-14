@@ -3,7 +3,7 @@ import uuid
 import pytest
 from pydantic import ValidationError
 
-from app.schema import LayoutElement, UserCreate
+from app.schema import LayoutElement, UserCreate, UserLogin, PasswordResetRequest
 from app.services.auth_service import create_access_token, decode_access_token, hash_password, verify_password
 from app.api.auth import _hash_reset_token
 
@@ -43,6 +43,12 @@ def test_user_create_rejects_weak_password():
     user = UserCreate(email="user@example.com", password="StrongPass123")
     assert user.email == "user@example.com"
     assert user.password == "StrongPass123"
+
+
+def test_auth_email_inputs_are_case_insensitive_and_trimmed():
+    assert UserCreate(email="  Student@Example.COM  ", password="StrongPass123").email == "student@example.com"
+    assert UserLogin(email="Student@Example.COM ", password="StrongPass123").email == "student@example.com"
+    assert PasswordResetRequest(email="Student@Example.COM ").email == "student@example.com"
 
 
 def test_layout_element_accepts_ocr_confidence_percent_scale():

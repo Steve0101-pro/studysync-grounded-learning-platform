@@ -1,0 +1,84 @@
+{
+  "evaluation_status": "partial_metric_failures",
+  "metric_type": "ragas_external_llm_judge",
+  "provider": "NVIDIA API Catalog",
+  "case_count": 100,
+  "dataset_status": "machine_generated_candidate_not_human_reviewed",
+  "human_reviewed": false,
+  "ragas_scored_case_count": 80,
+  "expected_abstention_fraction": 0.2,
+  "judge_model": "openai/gpt-oss-20b",
+  "embedding_model": "nvidia/nemotron-3-embed-1b",
+  "api_base_url": "https://integrate.api.nvidia.com/v1",
+  "run_config": {
+    "timeout_seconds": 120,
+    "max_retries": 2,
+    "max_workers": 8
+  },
+  "cases_sha256": "a5b45c3d9af7627c24cb52f91194191e2d613a2305152ee33d44310ec9df14a3",
+  "responses_sha256": "a5f3ce11d5fc18b94e9d549c863a641b1077f213700b07525dd77c122899ff87",
+  "corpus_sha256": "4698fdb604c2391ce34994d3580c61e17e6f34405d319cfe7a4e92139aedf0a3",
+  "evaluated_at_utc": "2026-10-14T13:49:10.530153+00:00",
+  "baselines": {
+    "no_rag": {
+      "faithfulness": 0.0,
+      "answer_relevancy": 0.7135706435153641,
+      "context_precision": 0.0,
+      "context_recall": 0.0,
+      "metric_valid_case_counts": {
+        "faithfulness": 80,
+        "answer_relevancy": 80,
+        "context_precision": 80,
+        "context_recall": 80
+      },
+      "metric_failed_case_counts": {
+        "faithfulness": 0,
+        "answer_relevancy": 0,
+        "context_precision": 0,
+        "context_recall": 0
+      },
+      "evaluation_status": "complete",
+      "out_of_scope_abstention_accuracy": 0.0
+    },
+    "naive_rag": {
+      "faithfulness": 0.5852813852813853,
+      "answer_relevancy": 0.5641266902344538,
+      "context_precision": 0.69999999993,
+      "context_recall": 0.625,
+      "metric_valid_case_counts": {
+        "faithfulness": 77,
+        "answer_relevancy": 79,
+        "context_precision": 80,
+        "context_recall": 80
+      },
+      "metric_failed_case_counts": {
+        "faithfulness": 3,
+        "answer_relevancy": 1,
+        "context_precision": 0,
+        "context_recall": 0
+      },
+      "evaluation_status": "partial_metric_failures",
+      "out_of_scope_abstention_accuracy": 1.0
+    },
+    "full_pipeline": {
+      "faithfulness": 0.8185654008438817,
+      "answer_relevancy": 0.6206313479995595,
+      "context_precision": 0.7392094016565403,
+      "context_recall": 0.9125,
+      "metric_valid_case_counts": {
+        "faithfulness": 79,
+        "answer_relevancy": 80,
+        "context_precision": 78,
+        "context_recall": 80
+      },
+      "metric_failed_case_counts": {
+        "faithfulness": 1,
+        "answer_relevancy": 0,
+        "context_precision": 2,
+        "context_recall": 0
+      },
+      "evaluation_status": "partial_metric_failures",
+      "out_of_scope_abstention_accuracy": 1.0
+    }
+  }
+}

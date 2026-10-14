@@ -35,4 +35,5 @@ def setup_rate_limiting(app: FastAPI) -> None:
 RATE_LIMIT_AUTH = "5/minute"
 RATE_LIMIT_DOCUMENTS = "10/minute"
 RATE_LIMIT_MULTIMODAL = "5/minute"
+RATE_LIMIT_STUDY = "10/minute"
 RATE_LIMIT_GENERAL = "100/minute"

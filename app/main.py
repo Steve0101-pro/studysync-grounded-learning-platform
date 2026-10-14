@@ -1,5 +1,6 @@
 import logging
-from fastapi import FastAPI, Request
+import anyio
+from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -9,10 +10,19 @@ from app.api.multimodal_router import router as multimodal_router
 from app.api.auth import router as auth_router
 from app.api.monitoring import router as monitoring_router
 from app.api.feedback import router as feedback_router
+from app.api.learning import (
+    assessments_router,
+    courses_router,
+    dashboard_router,
+    sources_router,
+    tutor_router,
+)
 from app.rate_limit import setup_rate_limiting
 from app.api.redis_service import close_redis, check_redis_health, CacheMetrics
 from app.services.portkeys_service import portkeys_client
 from app.config import settings
+from app.database import check_database_connection
+from app.services.neo4j_service import close_neo4j, neo4j_health
 
 # Initialize logging
 setup_logging()
@@ -46,6 +56,7 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Shutting down application...")
     await close_redis()
+    close_neo4j()
     logger.info("Application shutdown complete")
 
 
@@ -103,13 +114,26 @@ async def redis_health_check():
 @app.get("/health/full", tags=["Health"])
 async def full_health_check():
     """Comprehensive health check including all services."""
+    database_is_healthy = await check_database_connection()
     redis_is_healthy = await check_redis_health()
     cache_stats = CacheMetrics.get_stats()
+    graph_status = await anyio.to_thread.run_sync(neo4j_health)
     return {
-        "api_status": "healthy",
+        "api_status": "healthy" if database_is_healthy else "degraded",
+        "database_status": "healthy" if database_is_healthy else "unhealthy",
+        "neo4j": graph_status,
         "redis_status": "healthy" if redis_is_healthy else "unhealthy",
         "cache_metrics": cache_stats,
-    }
+    } if database_is_healthy else JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={
+            "api_status": "degraded",
+            "database_status": "unhealthy",
+            "neo4j": graph_status,
+            "redis_status": "healthy" if redis_is_healthy else "unhealthy",
+            "cache_metrics": cache_stats,
+        },
+    )
 
 
 # Include routers
@@ -118,6 +142,11 @@ app.include_router(documents_router)
 app.include_router(multimodal_router)
 app.include_router(monitoring_router)
 app.include_router(feedback_router)
+app.include_router(courses_router)
+app.include_router(sources_router)
+app.include_router(tutor_router)
+app.include_router(assessments_router)
+app.include_router(dashboard_router)
 
 logger.info("Application routers configured")
 logger.info("Available endpoints: /, /health/redis, /health/full, /monitoring/*, /docs (Swagger UI)")

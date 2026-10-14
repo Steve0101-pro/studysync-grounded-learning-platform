@@ -21,6 +21,8 @@ class AppSettings(BaseSettings):
         description="PostgreSQL database URL"
     )
     
+    DATABASE_CONNECT_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=60)
+
     # Environment
     ENVIRONMENT: Literal["development", "staging", "production"] = Field(
         default="development",
@@ -43,31 +45,89 @@ class AppSettings(BaseSettings):
     )
     
     NVIDIA_API_KEY: SecretStr = Field(
+        default=SecretStr(""),
         description="NVIDIA API key"
+    )
+    STUDY_TUTOR_NVIDIA_MODEL: str = Field(
+        default="nvidia/nemotron-3-super-120b-a12b",
+        description="First NVIDIA model attempted for grounded study tutoring"
     )
     NVIDIA_BASE_URL: str = Field(
         default="https://integrate.api.nvidia.com/v1",
         description="NVIDIA API base URL"
     )
     NVIDIA_PRIMARY_MODEL: str = Field(
+        default="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+        description="NVIDIA primary reasoning model"
+    )
+    NVIDIA_FALLBACK_MODEL: str = Field(
+        default="nvidia/nemotron-3-super-120b-a12b",
+        description="NVIDIA fallback reasoning model"
+    )
+    NVIDIA_VISION_MODEL: str = Field(
         default="meta/llama-3.2-90b-vision-instruct",
-        description="NVIDIA primary model"
+        description="NVIDIA primary vision model"
+    )
+    NVIDIA_VISION_FALLBACK_MODEL: str = Field(
+        default="meta/llama-3.2-11b-vision-instruct",
+        description="NVIDIA fallback vision model"
     )
     
     GROQ_API_KEY: SecretStr = Field(
+        default=SecretStr(""),
         description="Groq API key"
     )
     GROQ_MODEL: str = Field(
-        default="mixtral-8x7b-32768",
-        description="Groq model"
+        default="whisper-large-v3-turbo",
+        description="Primary Groq speech-to-text model"
+    )
+    GROQ_STT_FALLBACK_MODEL: str = Field(
+        default="whisper-large-v3",
+        description="Fallback Groq speech-to-text model"
     )
     
+    GROQ_FALLBACK_MODEL: str = Field(
+        default="openai/gpt-oss-120b",
+        description="Groq chat fallback model"
+    )
+
+    MODEL_CONNECT_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0, le=60)
+    MODEL_READ_TIMEOUT_SECONDS: float = Field(default=60.0, gt=0, le=300)
+    MODEL_WRITE_TIMEOUT_SECONDS: float = Field(default=60.0, gt=0, le=120)
+    MODEL_POOL_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0, le=60)
+    MODEL_MAX_RETRIES: int = Field(default=1, ge=0, le=3)
+    TRANSCRIPTION_TIMEOUT_SECONDS: float = Field(default=120.0, gt=0, le=600)
+
+    # Study retrieval
+    QDRANT_URL: str = Field(default="", description="Optional Qdrant Cloud URL")
+    QDRANT_API_KEY: SecretStr = Field(default=SecretStr(""), description="Optional Qdrant Cloud API key")
+    QDRANT_LOCAL_PATH: str = Field(default=".qdrant", description="Persistent local Qdrant storage path")
+    STUDY_EMBEDDING_MODEL: str = Field(
+        default="sentence-transformers/all-MiniLM-L6-v2",
+        description="FastEmbed model used to vectorize study passages"
+    )
+    STUDY_LATE_EMBEDDING_MODEL: str = Field(
+        default="jinaai/jina-embeddings-v2-small-en-tokens",
+        description="FastEmbed token model used for semantic and late chunking"
+    )
+    TESSERACT_CMD: str = Field(
+        default="",
+        description="Optional path to the Tesseract executable used for OCR",
+    )
+    NEO4J_URI: str = Field(default="", description="Optional Neo4j connection URI")
+    NEO4J_USERNAME: str = Field(default="neo4j", description="Neo4j username")
+    NEO4J_PASSWORD: SecretStr = Field(default=SecretStr(""), description="Neo4j password")
+
     GEMINI_API_KEY: SecretStr = Field(
         description="Google Gemini API key"
     )
     GEMINI_MODEL: str = Field(
-        default="gemini-2.0-flash",
+        default="gemini-3.6-flash",
         description="Google Gemini model"
+    )
+    GEMINI_FALLBACK_MODEL: str = Field(
+        default="gemini-3.1-flash-lite",
+        description="Fallback Google Gemini model",
     )
     GEMINI_TTS_MODEL: str = Field(
         default="gemini-2.0-flash",

@@ -1,10 +1,12 @@
+"""SQLAlchemy models used by the application."""
+
 import uuid
 
-from sqlalchemy import Column
+from sqlalchemy import Column, Index
 from sqlalchemy import DateTime
 from sqlalchemy import String
-from sqlalchemy import Text, ForeignKey
-from sqlalchemy import func
+from sqlalchemy import Text, ForeignKey, Integer, UniqueConstraint
+from sqlalchemy import func, text
 from sqlalchemy.orm import MappedColumn,mapped_column,relationship
 from sqlalchemy.dialects.postgresql import UUID,JSONB
 from datetime import datetime
@@ -16,6 +18,7 @@ from typing import Any, Optional
 class User(Base):
 
     __tablename__ = "users"
+    __table_args__ = (Index("uq_users_email_lower", func.lower(text("email")), unique=True),)
 
     id: MappedColumn[uuid.UUID] = mapped_column(UUID(as_uuid=True),primary_key=True,default=uuid.uuid4,)
 
@@ -136,5 +139,87 @@ class TTSRecord(Base):
     created_at: MappedColumn[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class StudySource(Base):
+    __tablename__ = "study_sources"
+    __table_args__ = (
+        UniqueConstraint("user_id", "content_sha256", name="uq_study_sources_user_checksum"),
+    )
+
+    id: MappedColumn[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: MappedColumn[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True
+    )
+    filename: MappedColumn[str] = mapped_column(String(255), nullable=False)
+    content_type: MappedColumn[str] = mapped_column(String(100), nullable=False)
+    storage_path: MappedColumn[str] = mapped_column(String(500), nullable=False)
+    content_sha256: MappedColumn[str] = mapped_column(String(64), nullable=False)
+    page_count: MappedColumn[int] = mapped_column(Integer, nullable=False)
+    unit_count: MappedColumn[int] = mapped_column(Integer, nullable=False)
+    created_at: MappedColumn[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    content_units = relationship(
+        "StudyContentUnit",
+        back_populates="source",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 
+class StudyContentUnit(Base):
+    __tablename__ = "study_content_units"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_id",
+            "location_type",
+            "location_number",
+            "chunk_level",
+            "chunk_index",
+            name="uq_study_content_location_chunk",
+        ),
+    )
+
+    id: MappedColumn[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_id: MappedColumn[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("study_sources.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    location_type: MappedColumn[str] = mapped_column(String(16), nullable=False)
+    location_number: MappedColumn[int] = mapped_column(Integer, nullable=False)
+    chunk_level: MappedColumn[str] = mapped_column(String(16), nullable=False, default="child")
+    chunk_index: MappedColumn[int] = mapped_column(Integer, nullable=False)
+    parent_unit_id: MappedColumn[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("study_content_units.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    char_start: MappedColumn[int | None] = mapped_column(Integer, nullable=True)
+    char_end: MappedColumn[int | None] = mapped_column(Integer, nullable=True)
+    content: MappedColumn[str] = mapped_column(Text, nullable=False)
+
+    source = relationship("StudySource", back_populates="content_units")
+
+
+class StudyQuizQuestion(Base):
+    __tablename__ = "study_quiz_questions"
+
+    id: MappedColumn[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: MappedColumn[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    topic: MappedColumn[str] = mapped_column(String(255), nullable=False, index=True)
+    prompt: MappedColumn[str] = mapped_column(Text, nullable=False)
+    options: MappedColumn[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    answer_index: MappedColumn[int] = mapped_column(Integer, nullable=False)
+    source_id: MappedColumn[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("study_sources.id", ondelete="CASCADE"), nullable=False
+    )
+    location_type: MappedColumn[str] = mapped_column(String(16), nullable=False)
+    location_number: MappedColumn[int] = mapped_column(Integer, nullable=False)
+    deduplication_key: MappedColumn[str | None] = mapped_column(String(64), nullable=True)
+    answered_index: MappedColumn[int | None] = mapped_column(Integer, nullable=True)
+    created_at: MappedColumn[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    answered_at: MappedColumn[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -5,7 +5,8 @@ import smtplib
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -73,7 +74,7 @@ async def register(
     try:
         # Check whether email already exists
         result = await db.execute(
-            select(User).where(User.email == user_data.email)
+            select(User).where(func.lower(User.email) == user_data.email)
         )
         existing_user = result.scalar_one_or_none()
 
@@ -109,13 +110,27 @@ async def register(
     
     except HTTPException:
         raise
-    except Exception as e:
+    except IntegrityError as exc:
         await db.rollback()
-        logger.error(f"Error during registration: {str(e)}", exc_info=True)
+        logger.info("Concurrent registration rejected by email uniqueness constraint")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Email already registered",
+        ) from exc
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        logger.exception("Database unavailable during registration")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication service is temporarily unavailable",
+        ) from exc
+    except Exception as exc:
+        await db.rollback()
+        logger.exception("Unexpected registration failure")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Registration failed",
-        )
+        ) from exc
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -133,7 +148,7 @@ async def login(
     """
     try:
         result = await db.execute(
-            select(User).where(User.email == user_data.email)
+            select(User).where(func.lower(User.email) == user_data.email)
         )
         user = result.scalar_one_or_none()
 
@@ -175,12 +190,18 @@ async def login(
     
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error during login: {str(e)}", exc_info=True)
+    except SQLAlchemyError as exc:
+        logger.exception("Database unavailable during login")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication service is temporarily unavailable",
+        ) from exc
+    except Exception as exc:
+        logger.exception("Unexpected login failure")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Login failed",
-        )
+        ) from exc
 
 
 @router.post("/forgot-password", status_code=status.HTTP_202_ACCEPTED)
@@ -191,7 +212,7 @@ async def forgot_password(
     db: AsyncSession = Depends(get_db),
 ):
     """Issue a short-lived one-time reset token without revealing account existence."""
-    user = await db.scalar(select(User).where(User.email == payload.email))
+    user = await db.scalar(select(User).where(func.lower(User.email) == payload.email))
     if user:
         token = secrets.token_urlsafe(48)
         reset_record = PasswordResetToken(

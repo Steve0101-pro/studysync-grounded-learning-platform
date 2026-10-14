@@ -38,7 +38,7 @@ def _has_document_signature(file_bytes: bytes, content_type: str) -> bool:
     return False
 
 
-async def _cleanup_storage_path(storage_path: str | None) -> None:
+async def _cleanup_storage_path(storage_path: str |  None) -> None:
     if not storage_path:
         return
     try:
@@ -72,7 +72,7 @@ async def upload_process_document(
             )
         
         # Read file
-        file_bytes = await file.read()
+        file_bytes = await file.read(MAX_FILE_SIZE + 1)
         
         # Validate file size
         if len(file_bytes) > MAX_FILE_SIZE:
@@ -87,8 +87,11 @@ async def upload_process_document(
                 status_code=400,
                 detail="Uploaded file is empty",
             )
-            if not _has_document_signature(file_bytes, file.content_type):
-                raise HTTPException(status_code=400, detail="Document content does not match its declared type")
+        if not _has_document_signature(file_bytes, file.content_type):
+            raise HTTPException(
+                status_code=400,
+                detail="Document content does not match its declared type",
+            )
 
         logger.info(f"Processing document: {file.filename} for user {current_user.id}")
 
@@ -290,4 +293,3 @@ async def invalidate_cache(
             status_code=500,
             detail="Failed to invalidate cache",
         )
-

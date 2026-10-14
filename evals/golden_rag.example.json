@@ -1,0 +1,18 @@
+[
+  {
+    "id": "biology-001",
+    "question": "What produces ATP during cellular respiration?",
+    "reference_answer": "Mitochondria produce ATP during cellular respiration.",
+    "reference_facts": [
+      "Mitochondria produce ATP"
+    ],
+    "ground_truth": "Mitochondria produce ATP during cellular respiration.",
+    "gold_context_ids": [
+      "source-uuid:page:2:chunk:0"
+    ],
+    "reference_contexts": [
+      "Mitochondria produce ATP during cellular respiration."
+    ],
+    "expected_abstention": false
+  }
+]

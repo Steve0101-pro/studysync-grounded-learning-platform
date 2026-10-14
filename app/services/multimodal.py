@@ -4,6 +4,7 @@ import time
 from langsmith import traceable
 
 # Ensure these point to the new async implementations we created
+from app.config import settings
 from app.services.gemini_vlm_service import generate_response
 from app.services.stt import transcribe_audio
 from app.services.tts_services import text_to_speech
@@ -32,7 +33,7 @@ async def process_multimodal_request(
     workflow_timer = LATENCY.labels("multimodal").time()
     workflow_timer.__enter__()
     try:
-        # 1. Transcription (Groq STT)
+        # 1. Gemini transcription
         stt_start = time.time()
         try:
             transcript = await transcribe_audio(
@@ -52,8 +53,8 @@ async def process_multimodal_request(
         # Track STT call to Portkeys (non-blocking)
         asyncio.create_task(
             portkeys_client.track_llm_call(
-                provider="groq",
-                model="whisper-large-v3",
+                provider="google",
+                model=settings.GEMINI_MODEL,
                 request_type="speech-to-text",
                 input_tokens=0,
                 output_tokens=len(transcript.split()),
@@ -82,7 +83,7 @@ async def process_multimodal_request(
         asyncio.create_task(
             portkeys_client.track_llm_call(
                 provider="google",
-                model="gemini-2.0-pro",
+                model=settings.GEMINI_MODEL,
                 request_type="multimodal",
                 input_tokens=len(transcript.split()),
                 output_tokens=len(response_text.split()),
@@ -107,7 +108,7 @@ async def process_multimodal_request(
         asyncio.create_task(
             portkeys_client.track_llm_call(
                 provider="google",
-                model="gemini-2.0-pro",
+                model=settings.GEMINI_TTS_MODEL,
                 request_type="text-to-speech",
                 input_tokens=len(response_text.split()),
                 output_tokens=0,

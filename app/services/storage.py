@@ -61,3 +61,28 @@ def delete_file(storage_path: str) -> None:
         with storage_lock:
             supabase.storage.from_(supabase_bucket).remove([storage_path])
 
+
+def download_file(storage_path: str) -> bytes:
+    """Download an object from the configured private storage bucket."""
+    if not storage_path:
+        raise ValueError("Cannot download an object with an empty storage path")
+    with storage_lock:
+        response = supabase.storage.from_(supabase_bucket).download(storage_path)
+    if not isinstance(response, bytes) or not response:
+        raise RuntimeError("Storage provider returned an empty or invalid object")
+    return response
+
+
+def create_signed_url(storage_path: str, expires_in: int) -> str:
+    """Create a short-lived URL for an authenticated, owner-checked source."""
+    if not storage_path:
+        raise ValueError("Cannot create a URL for an empty storage path")
+    with storage_lock:
+        response = supabase.storage.from_(supabase_bucket).create_signed_url(
+            storage_path,
+            expires_in,
+        )
+    signed_url = response.get("signedURL") or response.get("signedUrl")
+    if not isinstance(signed_url, str) or not signed_url:
+        raise RuntimeError("Storage provider did not return a signed URL")
+    return signed_url
