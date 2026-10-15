@@ -10,8 +10,8 @@ import uuid
 import base64
 from collections import defaultdict
 from functools import partial
-from datetime import datetime, timezone
-from typing import Literal
+from datetime import datetime, timedelta, timezone
+from typing import Any, Literal
 from urllib.parse import urljoin
 
 import anyio
@@ -25,10 +25,23 @@ from sqlalchemy.orm import aliased
 from app.config import settings
 from app.database import SessionLocal, get_db
 from app.dependencies.auth import get_current_user
-from app.models import Conversation, Message, StudyContentUnit, StudyQuizQuestion, StudySource, User
+from app.models import (
+    Conversation,
+    Message,
+    StudyContentUnit,
+    StudyMockExam,
+    StudyQuizQuestion,
+    StudySource,
+    User,
+)
 from app.rate_limit import limiter, RATE_LIMIT_STUDY
 from app.schema import (
     StudyProgressResponse,
+    StudyMockExamCreate,
+    StudyMockExamResponse,
+    StudyMockExamResult,
+    StudyMockExamSummary,
+    StudyMockExamSubmit,
     StudyQuizAnswer,
     StudyQuizCreate,
     StudyQuizResponse,
@@ -38,6 +51,12 @@ from app.schema import (
 )
 from app.services.storage import create_signed_url, delete_file, download_file, upload_file
 from app.services.study_orchestration import run_study_tutor, stream_study_tutor
+from app.services.study_assessment import (
+    generate_verified_assessment,
+    grade_numerical_answer,
+    grade_short_answer,
+    normalize_answer,
+)
 from app.services.qdrant_service import index_study_passages, search_study_passages
 from app.services.neo4j_service import index_source_passages
 from app.services.media_validation import (
@@ -69,6 +88,16 @@ from app.services.stt import transcribe_audio
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/study", tags=["Study materials"])
 
+
+def _quiz_correct_expression():
+    return case(
+        (
+            StudyQuizQuestion.is_correct.is_not(None),
+            StudyQuizQuestion.is_correct,
+        ),
+        else_=StudyQuizQuestion.answered_index == StudyQuizQuestion.answer_index,
+    )
+
 VIDEO_CONTENT_TYPES = {
     "mp4": "video/mp4",
     "webm": "video/webm",
@@ -95,6 +124,11 @@ async def _retrieve_study_units(
     user_id,
     query: str,
     limit: int = 10,
+    *,
+    source_id: uuid.UUID | None = None,
+    location_type: str | None = None,
+    location_start: int | None = None,
+    location_end: int | None = None,
 ):
     terms = list(dict.fromkeys(tokenize(query)))
     if not terms:
@@ -111,6 +145,22 @@ async def _retrieve_study_units(
         .where(StudySource.user_id == user_id)
         .where(StudyContentUnit.chunk_level == "child")
         .where(or_(*predicates))
+        .where(StudySource.id == source_id if source_id is not None else True)
+        .where(
+            StudyContentUnit.location_type == location_type
+            if location_type is not None
+            else True
+        )
+        .where(
+            StudyContentUnit.location_number >= location_start
+            if location_start is not None
+            else True
+        )
+        .where(
+            StudyContentUnit.location_number <= location_end
+            if location_end is not None
+            else True
+        )
         .limit(500)
     )
     rows = [
@@ -916,7 +966,7 @@ async def stream_study_tutor_turn(
     practice_result = await db.execute(
         select(
             StudyQuizQuestion.topic,
-            StudyQuizQuestion.answered_index == StudyQuizQuestion.answer_index,
+            _quiz_correct_expression(),
             StudyQuizQuestion.answered_at,
         ).where(
             StudyQuizQuestion.user_id == current_user.id,
@@ -1081,7 +1131,16 @@ async def create_study_quiz(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    candidates = await _retrieve_study_units(db, current_user.id, payload.topic, limit=500)
+    candidates = await _retrieve_study_units(
+        db,
+        current_user.id,
+        payload.topic,
+        limit=500,
+        source_id=payload.source_id,
+        location_type=payload.location_type,
+        location_start=payload.location_start,
+        location_end=payload.location_end,
+    )
     distinct_units = []
     seen_ids = set()
     for score, unit, source, _parent_content in candidates:
@@ -1109,6 +1168,20 @@ async def create_study_quiz(
         candidate
         for candidate in distinct_units
         if (
+            (payload.source_id is None or candidate[1].source_id == payload.source_id)
+            and (
+                payload.location_type is None
+                or candidate[1].location_type == payload.location_type
+            )
+            and (
+                payload.location_start is None
+                or payload.location_start
+                <= candidate[1].location_number
+                <= payload.location_end
+            )
+        )
+        if payload.assessment_type != "passage_selection"
+        or (
             candidate[1].source_id,
             candidate[1].location_type,
             candidate[1].location_number,
@@ -1122,55 +1195,137 @@ async def create_study_quiz(
         )
 
     correct_candidate = distinct_units[0]
-    all_units_result = await db.execute(
-        select(StudyContentUnit, StudySource)
-        .join(StudySource, StudyContentUnit.source_id == StudySource.id)
-        .where(StudySource.user_id == current_user.id)
-        .where(StudyContentUnit.chunk_level == "child")
-        .limit(500)
-    )
-    other_units = [
-        (rank_content(payload.topic, unit.content), unit, source)
-        for unit, source in all_units_result.all()
-        if unit.id != correct_candidate[1].id
-    ]
-    unrelated_units = [candidate for candidate in other_units if candidate[0] == 0]
-    distractors = unrelated_units or sorted(other_units, key=lambda item: item[0])
-    option_candidates = [correct_candidate, *distractors[:3]]
-    if len(option_candidates) < 2:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Add at least two distinct course passages to create a practice question.",
+    assessment_data: dict[str, Any] = {}
+    if payload.assessment_type == "passage_selection":
+        all_units_result = await db.execute(
+            select(StudyContentUnit, StudySource)
+            .join(StudySource, StudyContentUnit.source_id == StudySource.id)
+            .where(StudySource.user_id == current_user.id)
+            .where(StudyContentUnit.chunk_level == "child")
+            .where(
+                StudySource.id == payload.source_id
+                if payload.source_id is not None
+                else True
+            )
+            .where(
+                StudyContentUnit.location_type == payload.location_type
+                if payload.location_type is not None
+                else True
+            )
+            .where(
+                StudyContentUnit.location_number >= payload.location_start
+                if payload.location_start is not None
+                else True
+            )
+            .where(
+                StudyContentUnit.location_number <= payload.location_end
+                if payload.location_end is not None
+                else True
+            )
+            .limit(500)
         )
+        other_units = [
+            (rank_content(payload.topic, unit.content), unit, source)
+            for unit, source in all_units_result.all()
+            if unit.id != correct_candidate[1].id
+            and (payload.source_id is None or source.id == payload.source_id)
+            and (
+                payload.location_type is None
+                or unit.location_type == payload.location_type
+            )
+            and (
+                payload.location_start is None
+                or payload.location_start <= unit.location_number <= payload.location_end
+            )
+        ]
+        unrelated_units = [candidate for candidate in other_units if candidate[0] == 0]
+        distractors = unrelated_units or sorted(other_units, key=lambda item: item[0])
+        option_candidates = [correct_candidate, *distractors[:3]]
+        if len(option_candidates) < 2:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Add at least two distinct course passages to create a practice question.",
+            )
 
-    secrets.SystemRandom().shuffle(option_candidates)
-    answer_index = option_candidates.index(correct_candidate)
-    options = [
-        {
-            "content": unit.content,
-            "filename": source.filename,
-            "source_id": source.id,
-            "location_type": unit.location_type,
-            "location_number": unit.location_number,
-        }
-        for _, unit, source in option_candidates
-    ]
-    question = StudyQuizQuestion(
-        user_id=current_user.id,
-        topic=payload.topic.strip(),
-        prompt=f"Which passage best supports the topic “{payload.topic.strip()}”?",
-        options=options,
-        answer_index=answer_index,
-        source_id=correct_candidate[2].id,
-        location_type=correct_candidate[1].location_type,
-        location_number=correct_candidate[1].location_number,
-        deduplication_key=hashlib.sha256(
+        secrets.SystemRandom().shuffle(option_candidates)
+        answer_index = option_candidates.index(correct_candidate)
+        options = [
+            {
+                "content": unit.content,
+                "filename": source.filename,
+                "source_id": str(source.id),
+                "location_type": unit.location_type,
+                "location_number": unit.location_number,
+            }
+            for _, unit, source in option_candidates
+        ]
+        prompt = f"Which passage best supports the topic “{payload.topic.strip()}”?"
+        deduplication_key = hashlib.sha256(
             (
-                f"{correct_candidate[2].id}:"
+                f"passage_selection:{correct_candidate[2].id}:"
                 f"{correct_candidate[1].location_type}:"
                 f"{correct_candidate[1].location_number}"
             ).encode("utf-8")
-        ).hexdigest(),
+        ).hexdigest()
+    else:
+        try:
+            generated, generation_provider = await generate_verified_assessment(
+                topic=payload.topic.strip(),
+                passage=correct_candidate[1].content,
+                assessment_type=payload.assessment_type,
+                difficulty=payload.difficulty,
+            )
+        except (RuntimeError, ValueError) as exc:
+            logger.exception(
+                "Could not generate a verified %s assessment item",
+                payload.assessment_type,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Could not generate and independently verify a question from this source. Please retry or choose another passage.",
+            ) from exc
+        prompt = generated["question"]
+        if payload.assessment_type == "multiple_choice":
+            options = [{"content": choice} for choice in generated["options"]]
+            answer_index = generated["answer_index"]
+            assessment_data = {
+                "explanation": generated["explanation"],
+                "source_passage": correct_candidate[1].content,
+                "source_filename": correct_candidate[2].filename,
+                "generation_provider": generation_provider,
+            }
+        else:
+            options = []
+            answer_index = 0
+            assessment_data = {
+                key: value
+                for key, value in generated.items()
+                if key != "question"
+            }
+            assessment_data.update(
+                source_passage=correct_candidate[1].content,
+                source_filename=correct_candidate[2].filename,
+                generation_provider=generation_provider,
+            )
+        deduplication_key = hashlib.sha256(
+            (
+                f"{payload.assessment_type}:{normalize_answer(prompt)}"
+            ).encode("utf-8")
+        ).hexdigest()
+
+    question = StudyQuizQuestion(
+        user_id=current_user.id,
+        topic=payload.topic.strip(),
+        prompt=prompt,
+        options=options,
+        answer_index=answer_index,
+        assessment_type=payload.assessment_type,
+        difficulty=payload.difficulty,
+        assessment_data=assessment_data,
+        source_id=correct_candidate[2].id,
+        location_type=correct_candidate[1].location_type,
+        location_number=correct_candidate[1].location_number,
+        deduplication_key=deduplication_key,
     )
     db.add(question)
     try:
@@ -1179,7 +1334,7 @@ async def create_study_quiz(
         await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="This source passage was just used in another practice question.",
+            detail="This practice question was just created in another request.",
         ) from exc
     await db.refresh(question)
     return {
@@ -1187,6 +1342,13 @@ async def create_study_quiz(
         "topic": question.topic,
         "prompt": question.prompt,
         "options": question.options,
+        "assessment_type": question.assessment_type,
+        "difficulty": question.difficulty,
+        "answered_index": None,
+        "answered_text": None,
+        "correct": None,
+        "explanation": None,
+        "citation": None,
     }
 
 
@@ -1205,12 +1367,90 @@ async def answer_study_quiz(
     )
     if question is None:
         raise HTTPException(status_code=404, detail="Practice question not found")
-    if question.answered_index is not None:
+    if question.answered_at is not None:
         raise HTTPException(status_code=409, detail="This practice question has already been answered")
-    if payload.selected_index >= len(question.options):
-        raise HTTPException(status_code=422, detail="Selected option does not exist")
+    assessment_type = question.assessment_type or "passage_selection"
+    answer_text: str | None = payload.answer_text
+    citation: dict[str, Any] | None = None
+    explanation: str | dict[str, Any]
+    if assessment_type in {"passage_selection", "multiple_choice"}:
+        if payload.selected_index is None:
+            raise HTTPException(status_code=422, detail="Select one of the available options")
+        if payload.selected_index >= len(question.options):
+            raise HTTPException(status_code=422, detail="Selected option does not exist")
+        correct = payload.selected_index == question.answer_index
+        question.answered_index = payload.selected_index
+        if assessment_type == "passage_selection":
+            explanation = question.options[question.answer_index]
+            citation = explanation
+        else:
+            data = question.assessment_data or {}
+            explanation = str(data.get("explanation", "Review the cited course source."))
+            citation = {
+                "content": data.get("source_passage", ""),
+                "filename": data.get("source_filename"),
+                "source_id": str(question.source_id),
+                "location_type": question.location_type,
+                "location_number": question.location_number,
+            }
+    elif assessment_type == "short_answer":
+        if payload.answer_text is None:
+            raise HTTPException(status_code=422, detail="Enter a short written answer")
+        data = question.assessment_data or {}
+        try:
+            correct, explanation = await grade_short_answer(
+                question=question.prompt,
+                answer=payload.answer_text,
+                rubric=data["rubric"],
+                reference_answer=data["answer"],
+                source_passage=data["source_passage"],
+            )
+        except (KeyError, RuntimeError, ValueError) as exc:
+            logger.exception("Short-answer grading failed for question %s", question_id)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="The answer could not be graded right now. Please retry.",
+            ) from exc
+        answer_text = payload.answer_text.strip()
+        citation = {
+            "content": data["source_passage"],
+            "filename": data.get("source_filename"),
+            "source_id": question.source_id,
+            "location_type": question.location_type,
+            "location_number": question.location_number,
+        }
+    elif assessment_type == "numerical":
+        if payload.numerical_value is None or payload.unit is None:
+            raise HTTPException(status_code=422, detail="Enter a numeric answer and unit")
+        data = question.assessment_data or {}
+        try:
+            correct = grade_numerical_answer(
+                answer_value=payload.numerical_value,
+                answer_unit=payload.unit,
+                expected_value=data["answer_value"],
+                expected_unit=data["unit"],
+                tolerance=data["tolerance"],
+            )
+            explanation = str(data.get("explanation", "Review the cited course source."))
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.exception("Numerical assessment data invalid for question %s", question_id)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="This numerical question could not be graded. Please generate another.",
+            ) from exc
+        answer_text = f"{payload.numerical_value:g} {payload.unit.strip()}"
+        citation = {
+            "content": data["source_passage"],
+            "filename": data.get("source_filename"),
+            "source_id": question.source_id,
+            "location_type": question.location_type,
+            "location_number": question.location_number,
+        }
+    else:
+        raise HTTPException(status_code=500, detail="Unsupported stored assessment type")
 
-    question.answered_index = payload.selected_index
+    question.answered_text = answer_text
+    question.is_correct = correct
     question.answered_at = datetime.now(timezone.utc)
     await db.commit()
     return {
@@ -1218,10 +1458,425 @@ async def answer_study_quiz(
         "topic": question.topic,
         "prompt": question.prompt,
         "options": question.options,
+        "assessment_type": assessment_type,
+        "difficulty": question.difficulty,
         "answered_index": question.answered_index,
-        "correct": question.answered_index == question.answer_index,
-        "explanation": question.options[question.answer_index],
+        "answered_text": question.answered_text,
+        "correct": correct,
+        "explanation": explanation,
+        "citation": citation,
     }
+
+
+@router.post(
+    "/mock-exams",
+    response_model=StudyMockExamResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+@limiter.limit(RATE_LIMIT_STUDY)
+async def create_study_mock_exam(
+    request: Request,
+    payload: StudyMockExamCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    candidates = await _retrieve_study_units(
+        db,
+        current_user.id,
+        payload.topic,
+        limit=500,
+    )
+    distinct_units = []
+    seen_ids = set()
+    for score, unit, source, _parent_content in candidates:
+        if unit.id not in seen_ids:
+            distinct_units.append((score, unit, source))
+            seen_ids.add(unit.id)
+    if not distinct_units:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No matching course passage was found for this mock exam topic.",
+        )
+
+    try:
+        question_specs = []
+        for index in range(payload.question_count):
+            assessment_type = payload.assessment_types[
+                index % len(payload.assessment_types)
+            ]
+            _, unit, source = distinct_units[index % len(distinct_units)]
+            try:
+                generated, provider = await generate_verified_assessment(
+                    topic=payload.topic.strip(),
+                    passage=unit.content,
+                    assessment_type=assessment_type,
+                    difficulty="medium",
+                )
+            except (RuntimeError, ValueError) as exc:
+                logger.exception(
+                    "Could not generate a verified mock-exam item of type %s",
+                    assessment_type,
+                )
+                await db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="The timed mock exam could not be fully generated and verified. Please retry.",
+                ) from exc
+
+            if assessment_type == "multiple_choice":
+                options = [{"content": choice} for choice in generated["options"]]
+                answer_index = generated["answer_index"]
+                assessment_data = {
+                    "explanation": generated["explanation"],
+                    "source_passage": unit.content,
+                    "source_filename": source.filename,
+                    "generation_provider": provider,
+                }
+            else:
+                options = []
+                answer_index = 0
+                assessment_data = {
+                    key: value
+                    for key, value in generated.items()
+                    if key != "question"
+                }
+                assessment_data.update(
+                    source_passage=unit.content,
+                    source_filename=source.filename,
+                    generation_provider=provider,
+                )
+
+            question_specs.append(
+                {
+                    "user_id": current_user.id,
+                    "topic": payload.topic.strip(),
+                    "prompt": generated["question"],
+                    "options": options,
+                    "answer_index": answer_index,
+                    "assessment_type": assessment_type,
+                    "difficulty": "medium",
+                    "assessment_data": assessment_data,
+                    "source_id": source.id,
+                    "location_type": unit.location_type,
+                    "location_number": unit.location_number,
+                    "deduplication_key": hashlib.sha256(
+                        f"{assessment_type}:{normalize_answer(generated['question'])}".encode(
+                            "utf-8"
+                        )
+                    ).hexdigest(),
+                }
+            )
+        exam = StudyMockExam(
+            user_id=current_user.id,
+            topic=payload.topic.strip(),
+            duration_seconds=payload.duration_minutes * 60,
+        )
+        db.add(exam)
+        await db.flush()
+        await db.refresh(exam)
+        questions = [
+            StudyQuizQuestion(mock_exam_id=exam.id, **question_spec)
+            for question_spec in question_specs
+        ]
+        db.add_all(questions)
+        await db.commit()
+        await db.refresh(exam)
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A question in this mock exam duplicates a previously generated question.",
+        ) from exc
+
+    started_at = exam.started_at
+    deadline_at = started_at + timedelta(seconds=exam.duration_seconds)
+    return {
+        "id": exam.id,
+        "topic": exam.topic,
+        "duration_minutes": payload.duration_minutes,
+        "started_at": started_at,
+        "deadline_at": deadline_at,
+        "questions": [
+            {
+                "id": question.id,
+                "prompt": question.prompt,
+                "assessment_type": question.assessment_type,
+                "difficulty": question.difficulty,
+                "options": question.options,
+            }
+            for question in questions
+        ],
+    }
+
+
+@router.get("/mock-exams", response_model=list[StudyMockExamSummary])
+async def list_study_mock_exams(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(StudyMockExam)
+        .where(StudyMockExam.user_id == current_user.id)
+        .order_by(StudyMockExam.started_at.desc())
+        .limit(20)
+    )
+    exams = result.scalars().all()
+    summaries = []
+    for exam in exams:
+        started_at = exam.started_at
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=timezone.utc)
+        report = exam.report_json or {}
+        summaries.append(
+            {
+                "id": exam.id,
+                "topic": exam.topic,
+                "started_at": started_at,
+                "deadline_at": started_at
+                + timedelta(seconds=exam.duration_seconds),
+                "submitted_at": exam.submitted_at,
+                "score": report.get("score"),
+            }
+        )
+    return summaries
+
+
+@router.get(
+    "/mock-exams/{exam_id}",
+    response_model=StudyMockExamResponse | StudyMockExamResult,
+)
+async def get_study_mock_exam(
+    exam_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    exam = await db.scalar(
+        select(StudyMockExam).where(
+            StudyMockExam.id == exam_id,
+            StudyMockExam.user_id == current_user.id,
+        )
+    )
+    if exam is None:
+        raise HTTPException(status_code=404, detail="Mock exam not found")
+    if exam.submitted_at is not None:
+        if not exam.report_json:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The saved mock-exam report is unavailable.",
+            )
+        return exam.report_json
+
+    question_result = await db.execute(
+        select(StudyQuizQuestion)
+        .where(
+            StudyQuizQuestion.mock_exam_id == exam.id,
+            StudyQuizQuestion.user_id == current_user.id,
+        )
+        .order_by(StudyQuizQuestion.created_at)
+    )
+    questions = question_result.scalars().all()
+    if not questions:
+        raise HTTPException(status_code=409, detail="This mock exam has no questions")
+    started_at = exam.started_at
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    return {
+        "id": exam.id,
+        "topic": exam.topic,
+        "duration_minutes": exam.duration_seconds // 60,
+        "started_at": started_at,
+        "deadline_at": started_at + timedelta(seconds=exam.duration_seconds),
+        "questions": [
+            {
+                "id": question.id,
+                "prompt": question.prompt,
+                "assessment_type": question.assessment_type,
+                "difficulty": question.difficulty,
+                "options": question.options,
+            }
+            for question in questions
+        ],
+    }
+
+
+@router.post(
+    "/mock-exams/{exam_id}/submit",
+    response_model=StudyMockExamResult,
+)
+async def submit_study_mock_exam(
+    exam_id: uuid.UUID,
+    payload: StudyMockExamSubmit,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    exam = await db.scalar(
+        select(StudyMockExam)
+        .where(
+            StudyMockExam.id == exam_id,
+            StudyMockExam.user_id == current_user.id,
+        )
+        .with_for_update()
+    )
+    if exam is None:
+        raise HTTPException(status_code=404, detail="Mock exam not found")
+    if exam.submitted_at is not None:
+        raise HTTPException(status_code=409, detail="This mock exam has already been submitted")
+
+    question_result = await db.execute(
+        select(StudyQuizQuestion).where(
+            StudyQuizQuestion.mock_exam_id == exam.id,
+            StudyQuizQuestion.user_id == current_user.id,
+        )
+    )
+    questions = question_result.scalars().all()
+    if not questions:
+        raise HTTPException(status_code=409, detail="This mock exam has no questions")
+
+    supplied_ids = [answer.question_id for answer in payload.answers]
+    if len(supplied_ids) != len(set(supplied_ids)):
+        raise HTTPException(status_code=422, detail="An exam question was answered more than once")
+    question_by_id = {question.id: question for question in questions}
+    if any(question_id not in question_by_id for question_id in supplied_ids):
+        raise HTTPException(status_code=422, detail="An answer does not belong to this mock exam")
+
+    now = datetime.now(timezone.utc)
+    started_at = exam.started_at
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    deadline_at = started_at + timedelta(seconds=exam.duration_seconds)
+    expired = now >= deadline_at
+    answer_by_id = {
+        answer.question_id: answer.answer
+        for answer in payload.answers
+    }
+    correct_count = answered_count = 0
+    results = []
+
+    for question in questions:
+        data = question.assessment_data or {}
+        answer = answer_by_id.get(question.id) if not expired else None
+        correct = False
+        feedback = "Not answered before the exam was submitted."
+        answered_text = None
+        answered_index = None
+        if answer is not None:
+            assessment_type = question.assessment_type
+            if assessment_type == "multiple_choice":
+                if answer.selected_index is None or answer.selected_index >= len(question.options):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Select an available option for every multiple-choice question.",
+                    )
+                answered_index = answer.selected_index
+                correct = answered_index == question.answer_index
+                feedback = str(data.get("explanation", "Review the source citation."))
+                correct_answer: str | float = question.options[question.answer_index]["content"]
+            elif assessment_type == "short_answer":
+                if answer.answer_text is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Provide a written answer for every short-answer question.",
+                    )
+                try:
+                    correct, feedback = await grade_short_answer(
+                        question=question.prompt,
+                        answer=answer.answer_text,
+                        rubric=data["rubric"],
+                        reference_answer=data["answer"],
+                        source_passage=data["source_passage"],
+                    )
+                except (KeyError, RuntimeError, ValueError) as exc:
+                    logger.exception("Mock-exam short-answer grading failed for %s", question.id)
+                    await db.rollback()
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="The mock exam could not be graded. Please retry submission.",
+                    ) from exc
+                answered_text = answer.answer_text.strip()
+                correct_answer = str(data["answer"])
+            elif assessment_type == "numerical":
+                if answer.numerical_value is None or answer.unit is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Provide a numeric value and unit for every numerical question.",
+                    )
+                try:
+                    correct = grade_numerical_answer(
+                        answer_value=answer.numerical_value,
+                        answer_unit=answer.unit,
+                        expected_value=data["answer_value"],
+                        expected_unit=data["unit"],
+                        tolerance=data["tolerance"],
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    logger.exception("Mock-exam numeric data invalid for %s", question.id)
+                    await db.rollback()
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="The mock exam could not be graded. Please retry submission.",
+                    ) from exc
+                answered_text = f"{answer.numerical_value:g} {answer.unit.strip()}"
+                feedback = str(data.get("explanation", "Review the source citation."))
+                correct_answer = f"{data['answer_value']:g} {data['unit']}"
+            else:
+                raise HTTPException(status_code=500, detail="Unsupported mock-exam question type")
+
+            question.answered_index = answered_index
+            question.answered_text = answered_text
+            question.is_correct = correct
+            question.answered_at = now
+            answered_count += 1
+            correct_count += int(correct)
+        else:
+            correct_answer = (
+                str(question.options[question.answer_index]["content"])
+                if question.assessment_type == "multiple_choice"
+                else (
+                    str(data.get("answer", ""))
+                    if question.assessment_type == "short_answer"
+                    else f"{data.get('answer_value', '')} {data.get('unit', '')}".strip()
+                )
+            )
+
+        results.append(
+            {
+                "question_id": str(question.id),
+                "question": question.prompt,
+                "assessment_type": question.assessment_type,
+                "answered": answer is not None,
+                "correct": correct,
+                "answer": answered_text if answered_text is not None else answered_index,
+                "correct_answer": correct_answer,
+                "feedback": feedback,
+                "citation": {
+                    "content": data.get("source_passage", ""),
+                    "filename": data.get("source_filename"),
+                    "source_id": question.source_id,
+                    "location_type": question.location_type,
+                    "location_number": question.location_number,
+                },
+            }
+        )
+
+    exam.submitted_at = now
+    report = {
+        "id": str(exam.id),
+        "topic": exam.topic,
+        "submitted_at": now.isoformat(),
+        "elapsed_seconds": min(
+            max(0, int((now - started_at).total_seconds())),
+            exam.duration_seconds,
+        ),
+        "expired": expired,
+        "total_questions": len(questions),
+        "answered_questions": answered_count,
+        "correct_answers": correct_count,
+        "score": correct_count / len(questions),
+        "results": results,
+    }
+    exam.report_json = report
+    await db.commit()
+    return report
 
 
 @router.get("/progress", response_model=StudyProgressResponse)
@@ -1236,12 +1891,9 @@ async def get_study_progress(
         select(
             StudyQuizQuestion.topic,
             func.count(StudyQuizQuestion.id),
-            func.sum(case((StudyQuizQuestion.answered_index.is_not(None), 1), else_=0)),
+            func.sum(case((StudyQuizQuestion.answered_at.is_not(None), 1), else_=0)),
             func.sum(
-                case(
-                    (StudyQuizQuestion.answered_index == StudyQuizQuestion.answer_index, 1),
-                    else_=0,
-                )
+                case((_quiz_correct_expression(), 1), else_=0)
             ),
         )
         .where(StudyQuizQuestion.user_id == current_user.id)
@@ -1251,12 +1903,11 @@ async def get_study_progress(
     history_rows = await db.execute(
         select(
             StudyQuizQuestion.topic,
-            StudyQuizQuestion.answered_index == StudyQuizQuestion.answer_index,
+            _quiz_correct_expression(),
             StudyQuizQuestion.answered_at,
         )
         .where(
             StudyQuizQuestion.user_id == current_user.id,
-            StudyQuizQuestion.answered_index.is_not(None),
             StudyQuizQuestion.answered_at.is_not(None),
         )
         .order_by(StudyQuizQuestion.topic, StudyQuizQuestion.answered_at)

@@ -2,8 +2,8 @@
 
 import uuid
 from datetime import date, datetime
-from typing import Any, Optional, List
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from typing import Any, Literal, Optional, List
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 from decimal import Decimal
 
 
@@ -125,28 +125,138 @@ class StudyTutorResponse(BaseModel):
 
 class StudyQuizCreate(BaseModel):
     topic: str = Field(min_length=2, max_length=255)
+    assessment_type: Literal[
+        "passage_selection",
+        "multiple_choice",
+        "short_answer",
+        "numerical",
+    ] = "passage_selection"
+    difficulty: Literal["easy", "medium", "hard"] = "medium"
+    source_id: uuid.UUID | None = None
+    location_type: Literal["page", "slide", "timestamp"] | None = None
+    location_start: int | None = Field(default=None, ge=0)
+    location_end: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_location_scope(self):
+        if (self.location_start is None) != (self.location_end is None):
+            raise ValueError("location_start and location_end must be provided together")
+        if self.location_start is not None:
+            if self.location_type is None:
+                raise ValueError("location_type is required for a location range")
+            if self.location_start > self.location_end:
+                raise ValueError("location_start must not exceed location_end")
+        if self.location_type is not None and self.source_id is None:
+            raise ValueError("source_id is required when selecting a location type")
+        return self
 
 
 class StudyQuizOption(BaseModel):
     content: str
-    filename: str
-    source_id: uuid.UUID
-    location_type: str
-    location_number: int
+    filename: str | None = None
+    source_id: uuid.UUID | None = None
+    location_type: str | None = None
+    location_number: int | None = None
 
 
 class StudyQuizResponse(BaseModel):
     id: uuid.UUID
     topic: str
     prompt: str
+    assessment_type: str = "passage_selection"
+    difficulty: str = "medium"
     options: list[StudyQuizOption]
     answered_index: int | None = None
+    answered_text: str | None = None
     correct: bool | None = None
-    explanation: StudyQuizOption | None = None
+    explanation: str | StudyQuizOption | None = None
+    citation: StudyQuizOption | None = None
 
 
 class StudyQuizAnswer(BaseModel):
-    selected_index: int = Field(ge=0, le=3)
+    selected_index: int | None = Field(default=None, ge=0, le=3)
+    answer_text: str | None = Field(default=None, min_length=1, max_length=10_000)
+    numerical_value: float | None = Field(default=None, allow_inf_nan=False)
+    unit: str | None = Field(default=None, max_length=40)
+
+    @model_validator(mode="after")
+    def validate_answer_shape(self):
+        supplied = sum(
+            value is not None
+            for value in (self.selected_index, self.answer_text, self.numerical_value)
+        )
+        if supplied != 1:
+            raise ValueError("Provide exactly one selected_index, answer_text, or numerical_value")
+        if self.numerical_value is not None and not (self.unit and self.unit.strip()):
+            raise ValueError("unit is required for a numerical answer")
+        if self.numerical_value is None and self.unit is not None:
+            raise ValueError("unit is only valid for a numerical answer")
+        if self.answer_text is not None and not self.answer_text.strip():
+            raise ValueError("answer_text must not be blank")
+        return self
+
+
+class StudyMockExamCreate(BaseModel):
+    topic: str = Field(min_length=2, max_length=255)
+    question_count: int = Field(default=5, ge=3, le=12)
+    duration_minutes: int = Field(default=20, ge=5, le=180)
+    assessment_types: list[
+        Literal["multiple_choice", "short_answer", "numerical"]
+    ] = Field(default_factory=lambda: ["multiple_choice", "short_answer", "numerical"])
+
+    @model_validator(mode="after")
+    def validate_assessment_types(self):
+        if not self.assessment_types:
+            raise ValueError("Select at least one assessment type")
+        return self
+
+
+class StudyMockExamQuestion(BaseModel):
+    id: uuid.UUID
+    prompt: str
+    assessment_type: str
+    difficulty: str
+    options: list[StudyQuizOption]
+
+
+class StudyMockExamResponse(BaseModel):
+    id: uuid.UUID
+    topic: str
+    duration_minutes: int
+    started_at: datetime
+    deadline_at: datetime
+    questions: list[StudyMockExamQuestion]
+
+
+class StudyMockExamAnswer(BaseModel):
+    question_id: uuid.UUID
+    answer: StudyQuizAnswer
+
+
+class StudyMockExamSubmit(BaseModel):
+    answers: list[StudyMockExamAnswer] = Field(default_factory=list, max_length=12)
+
+
+class StudyMockExamResult(BaseModel):
+    id: uuid.UUID
+    topic: str
+    submitted_at: datetime
+    elapsed_seconds: int
+    expired: bool
+    total_questions: int
+    answered_questions: int
+    correct_answers: int
+    score: float
+    results: list[dict[str, Any]]
+
+
+class StudyMockExamSummary(BaseModel):
+    id: uuid.UUID
+    topic: str
+    started_at: datetime
+    deadline_at: datetime
+    submitted_at: datetime | None
+    score: float | None
 
 
 class StudyProgressTopic(BaseModel):

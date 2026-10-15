@@ -11,6 +11,7 @@ from app.api.study import router as study_router
 from app.api.auth import router as auth_router
 from app.database import get_db
 from app.dependencies.auth import get_current_user
+from app.models import StudyMockExam, StudyQuizQuestion
 from app.rate_limit import setup_rate_limiting
 from app.services import study_orchestration
 from app.api import study as study_api
@@ -41,6 +42,9 @@ class _Result:
     def all(self):
         return self._rows
 
+    def scalars(self):
+        return self
+
 
 class _StudyDatabase:
     def __init__(
@@ -60,7 +64,7 @@ class _StudyDatabase:
 
     async def execute(self, statement):
         query = str(statement)
-        if "answered_at" in query:
+        if "answered_at" in query and "GROUP BY" not in query.upper():
             return _Result(self.mastery_events)
         if "study_quiz_questions" in query and "source_id" in query:
             return _Result(self.used_passages)
@@ -248,6 +252,390 @@ async def test_study_quiz_hides_answer_records_response_and_blocks_second_attemp
 
             exhausted = await client.post("/study/quizzes", json={"topic": topic})
             assert exhausted.status_code == 409
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_study_quiz_source_and_location_scope_applies_to_answer_and_choices():
+    topic = "mitochondria ATP"
+    user_id = uuid.uuid4()
+    selected_source_id = uuid.uuid4()
+    other_source_id = uuid.uuid4()
+    rows = [
+        _passage(selected_source_id, "biology.pdf", 2, "Mitochondria produce ATP during respiration."),
+        _passage(selected_source_id, "biology.pdf", 4, "ATP is synthesized in the mitochondrial membrane."),
+        _passage(selected_source_id, "biology.pdf", 8, "ATP transfers energy within a mitochondrion."),
+        _passage(other_source_id, "other.pdf", 3, "Mitochondria produce ATP in other course material."),
+    ]
+    rows.sort(key=lambda row: -rank_content(topic, row[0].content))
+    database = _StudyDatabase(rows)
+
+    async def override_db():
+        yield database
+
+    app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=user_id)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            created = await client.post(
+                "/study/quizzes",
+                json={
+                    "topic": topic,
+                    "source_id": str(selected_source_id),
+                    "location_type": "page",
+                    "location_start": 2,
+                    "location_end": 4,
+                },
+            )
+            invalid_range = await client.post(
+                "/study/quizzes",
+                json={
+                    "topic": topic,
+                    "source_id": str(selected_source_id),
+                    "location_type": "page",
+                    "location_start": 4,
+                    "location_end": 2,
+                },
+            )
+
+        assert created.status_code == 201
+        assert database.question.source_id == selected_source_id
+        assert database.question.location_number in {2, 4}
+        assert all(
+            option["source_id"] == str(selected_source_id)
+            and option["location_type"] == "page"
+            and 2 <= option["location_number"] <= 4
+            for option in created.json()["options"]
+        )
+        assert invalid_range.status_code == 422
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_multiple_choice_quiz_hides_key_and_returns_source_citation(monkeypatch):
+    user_id = uuid.uuid4()
+    rows = [
+        _passage(
+            uuid.uuid4(),
+            "biology.pdf",
+            2,
+            "Mitochondria produce ATP during cellular respiration.",
+        )
+    ]
+    database = _StudyDatabase(rows)
+
+    async def generate_verified_assessment(**_kwargs):
+        return (
+            {
+                "question": "What do mitochondria produce during respiration?",
+                "options": ["Glucose", "Oxygen", "ATP", "Protein"],
+                "answer_index": 2,
+                "explanation": "The passage states that respiration produces ATP.",
+            },
+            "test+verified",
+        )
+
+    monkeypatch.setattr(
+        study_api,
+        "generate_verified_assessment",
+        generate_verified_assessment,
+    )
+
+    async def override_db():
+        yield database
+
+    app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=user_id)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            created = await client.post(
+                "/study/quizzes",
+                json={
+                    "topic": "mitochondria ATP",
+                    "assessment_type": "multiple_choice",
+                    "difficulty": "easy",
+                },
+            )
+            assert created.status_code == 201
+            public_question = created.json()
+            assert public_question["assessment_type"] == "multiple_choice"
+            assert "answer_index" not in public_question
+            assert len(public_question["options"]) == 4
+
+            answered = await client.post(
+                f"/study/quizzes/{public_question['id']}/answer",
+                json={"selected_index": 2},
+            )
+
+        assert answered.status_code == 200
+        assert answered.json()["correct"] is True
+        assert answered.json()["explanation"] == (
+            "The passage states that respiration produces ATP."
+        )
+        assert answered.json()["citation"]["filename"] == "biology.pdf"
+        assert database.question.is_correct is True
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.parametrize(
+    ("assessment_type", "generated", "answer_payload"),
+    [
+        (
+            "short_answer",
+            {
+                "question": "What does the inner membrane support?",
+                "answer": "It supports ATP production.",
+                "rubric": ["The membrane supports ATP production."],
+                "explanation": "The passage links the inner membrane to ATP production.",
+            },
+            {"answer_text": "It is where ATP is produced."},
+        ),
+        (
+            "numerical",
+            {
+                "question": "What distance is stated in the source?",
+                "answer_value": 4.0,
+                "unit": "m",
+                "tolerance": 0.25,
+                "explanation": "The passage gives the value as four metres.",
+            },
+            {"numerical_value": 4.1, "unit": "m"},
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_short_and_numerical_quizzes_are_graded_and_cited(
+    assessment_type,
+    generated,
+    answer_payload,
+    monkeypatch,
+):
+    user_id = uuid.uuid4()
+    database = _StudyDatabase(
+        [
+            _passage(
+                uuid.uuid4(),
+                "lesson.pdf",
+                7,
+                "The inner membrane supports ATP production; the measured distance is four metres.",
+            )
+        ]
+    )
+
+    async def generate_verified_assessment(**_kwargs):
+        return ({**generated, "question": generated["question"]}, "test+verified")
+
+    async def grade_short_answer(**_kwargs):
+        return True, "Your answer identifies the source's key point."
+
+    monkeypatch.setattr(
+        study_api,
+        "generate_verified_assessment",
+        generate_verified_assessment,
+    )
+    monkeypatch.setattr(study_api, "grade_short_answer", grade_short_answer)
+
+    async def override_db():
+        yield database
+
+    app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=user_id)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            created = await client.post(
+                "/study/quizzes",
+                json={
+                    "topic": "inner membrane distance",
+                    "assessment_type": assessment_type,
+                },
+            )
+            assert created.status_code == 201
+            assert "answer" not in created.json()
+            answered = await client.post(
+                f"/study/quizzes/{created.json()['id']}/answer",
+                json=answer_payload,
+            )
+
+        assert answered.status_code == 200
+        assert answered.json()["correct"] is True
+        assert answered.json()["citation"]["location_number"] == 7
+        assert database.question.is_correct is True
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_timed_mock_exam_generates_mix_and_returns_final_cited_report(monkeypatch):
+    user_id = uuid.uuid4()
+    rows = [
+        _passage(uuid.uuid4(), "lesson.pdf", 2, "Mitochondria produce ATP."),
+        _passage(uuid.uuid4(), "lesson.pdf", 3, "The inner membrane supports ATP production."),
+        _passage(uuid.uuid4(), "lesson.pdf", 4, "A measured distance is four metres."),
+    ]
+
+    class _MockExamDatabase(_StudyDatabase):
+        def __init__(self, exam_rows):
+            super().__init__(exam_rows)
+            self.exam = None
+            self.exam_questions = []
+
+        async def execute(self, statement):
+            query = str(statement).lower()
+            if "study_quiz_questions.mock_exam_id" in query:
+                return _Result(self.exam_questions)
+            if "study_mock_exams" in query:
+                return _Result([self.exam] if self.exam else [])
+            return await super().execute(statement)
+
+        async def scalar(self, statement):
+            if "study_mock_exams" in str(statement):
+                return self.exam
+            return await super().scalar(statement)
+
+        def add(self, item):
+            if isinstance(item, StudyMockExam):
+                self.exam = item
+                return
+            if isinstance(item, StudyQuizQuestion):
+                self.exam_questions.append(item)
+                return
+            super().add(item)
+
+        def add_all(self, items):
+            for item in items:
+                item.id = item.id or uuid.uuid4()
+                self.exam_questions.append(item)
+
+        async def flush(self):
+            self.exam.id = self.exam.id or uuid.uuid4()
+            self.exam.started_at = datetime.now(timezone.utc)
+
+        async def refresh(self, item):
+            if isinstance(item, StudyMockExam):
+                return
+            if item.id is None:
+                item.id = uuid.uuid4()
+
+    database = _MockExamDatabase(rows)
+
+    async def generate_verified_assessment(*, assessment_type, **_kwargs):
+        if assessment_type == "multiple_choice":
+            return (
+                {
+                    "question": "Which molecule do mitochondria produce?",
+                    "options": ["Water", "ATP", "Glucose", "Protein"],
+                    "answer_index": 1,
+                    "explanation": "The passage states mitochondria produce ATP.",
+                },
+                "test+verified",
+            )
+        if assessment_type == "short_answer":
+            return (
+                {
+                    "question": "What does the inner membrane support?",
+                    "answer": "It supports ATP production.",
+                    "rubric": ["The membrane supports ATP production."],
+                    "explanation": "The inner membrane supports ATP production.",
+                },
+                "test+verified",
+            )
+        return (
+            {
+                "question": "What distance is stated?",
+                "answer_value": 4.0,
+                "unit": "m",
+                "tolerance": 0.1,
+                "explanation": "The source states four metres.",
+            },
+            "test+verified",
+        )
+
+    async def grade_short_answer(**_kwargs):
+        return True, "The response is supported."
+
+    monkeypatch.setattr(
+        study_api,
+        "generate_verified_assessment",
+        generate_verified_assessment,
+    )
+    monkeypatch.setattr(study_api, "grade_short_answer", grade_short_answer)
+
+    async def override_db():
+        yield database
+
+    app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=user_id)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            created = await client.post(
+                "/study/mock-exams",
+                json={
+                    "topic": "mitochondria ATP",
+                    "question_count": 3,
+                    "duration_minutes": 20,
+                    "assessment_types": [
+                        "multiple_choice",
+                        "short_answer",
+                        "numerical",
+                    ],
+                },
+            )
+            assert created.status_code == 201
+            exam = created.json()
+            assert len(exam["questions"]) == 3
+            assert all("answer_index" not in item for item in exam["questions"])
+            saved_exams = await client.get("/study/mock-exams")
+            resumed = await client.get(f"/study/mock-exams/{exam['id']}")
+            assert saved_exams.status_code == 200
+            assert saved_exams.json()[0]["id"] == exam["id"]
+            assert resumed.status_code == 200
+            assert len(resumed.json()["questions"]) == 3
+            assert all("assessment_data" not in item for item in resumed.json()["questions"])
+            answers = [
+                {
+                    "question_id": exam["questions"][0]["id"],
+                    "answer": {"selected_index": 1},
+                },
+                {
+                    "question_id": exam["questions"][1]["id"],
+                    "answer": {"answer_text": "The inner membrane supports ATP."},
+                },
+                {
+                    "question_id": exam["questions"][2]["id"],
+                    "answer": {"numerical_value": 4.0, "unit": "m"},
+                },
+            ]
+            submitted = await client.post(
+                f"/study/mock-exams/{exam['id']}/submit",
+                json={"answers": answers},
+            )
+            restored_report = await client.get(f"/study/mock-exams/{exam['id']}")
+
+        assert submitted.status_code == 200
+        report = submitted.json()
+        assert report["total_questions"] == 3
+        assert report["answered_questions"] == 3
+        assert report["correct_answers"] == 3
+        assert report["score"] == 1.0
+        assert all(item["citation"]["content"] for item in report["results"])
+        assert database.exam.report_json["correct_answers"] == 3
+        assert restored_report.status_code == 200
+        assert restored_report.json()["correct_answers"] == 3
     finally:
         app.dependency_overrides.clear()
 
@@ -602,7 +990,13 @@ def test_learning_api_is_split_by_user_workflow():
             "/study/conversations",
             "/study/conversations/{conversation_id}/messages",
         },
-        "assessments": {"/study/quizzes", "/study/quizzes/{question_id}/answer"},
+        "assessments": {
+            "/study/quizzes",
+            "/study/quizzes/{question_id}/answer",
+            "/study/mock-exams",
+            "/study/mock-exams/{exam_id}",
+            "/study/mock-exams/{exam_id}/submit",
+        },
         "dashboard": {"/study/progress"},
     }
     for name, router in routers.items():

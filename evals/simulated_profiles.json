@@ -1,0 +1,58 @@
+{
+  "fast_learner": {
+    "initial_mastery": [0.35, 0.45, 0.3, 0.4],
+    "learning_rate": 0.18,
+    "forgetting_rate": 0.005,
+    "slip_rate": 0.02,
+    "guess_rate": 0.1,
+    "misconception_rate": 0.0
+  },
+  "slow_learner": {
+    "initial_mastery": [0.15, 0.2, 0.1, 0.15],
+    "learning_rate": 0.04,
+    "forgetting_rate": 0.01,
+    "slip_rate": 0.08,
+    "guess_rate": 0.05,
+    "misconception_rate": 0.0
+  },
+  "forgetful": {
+    "initial_mastery": [0.5, 0.6, 0.45, 0.55],
+    "learning_rate": 0.08,
+    "forgetting_rate": 0.12,
+    "slip_rate": 0.08,
+    "guess_rate": 0.08,
+    "misconception_rate": 0.0
+  },
+  "careless": {
+    "initial_mastery": [0.65, 0.55, 0.7, 0.6],
+    "learning_rate": 0.08,
+    "forgetting_rate": 0.01,
+    "slip_rate": 0.28,
+    "guess_rate": 0.05,
+    "misconception_rate": 0.0
+  },
+  "guesser": {
+    "initial_mastery": [0.15, 0.2, 0.1, 0.15],
+    "learning_rate": 0.06,
+    "forgetting_rate": 0.02,
+    "slip_rate": 0.05,
+    "guess_rate": 0.4,
+    "misconception_rate": 0.0
+  },
+  "misconception_prone": {
+    "initial_mastery": [0.3, 0.25, 0.35, 0.2],
+    "learning_rate": 0.06,
+    "forgetting_rate": 0.03,
+    "slip_rate": 0.15,
+    "guess_rate": 0.05,
+    "misconception_rate": 0.08
+  },
+  "cold_start_novice": {
+    "initial_mastery": [0.08, 0.08, 0.08, 0.08],
+    "learning_rate": 0.08,
+    "forgetting_rate": 0.02,
+    "slip_rate": 0.12,
+    "guess_rate": 0.1,
+    "misconception_rate": 0.02
+  }
+}

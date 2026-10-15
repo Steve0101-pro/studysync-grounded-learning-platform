@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import fitz
@@ -78,6 +79,47 @@ def test_simulation_runs_three_profiles_conditions_and_five_sessions():
         row["question_repetition_rate"] <= 0.05
         for row in report["results"]
         if row["condition"] != "random"
+    )
+
+
+def test_trackd_simulation_covers_seven_behavior_profiles_and_all_conditions():
+    profile_path = Path(__file__).resolve().parents[1] / "evals" / "simulated_profiles.json"
+    profiles = json.loads(profile_path.read_text(encoding="utf-8"))
+
+    report = simulate(profiles, sessions=5, seed=42)
+
+    assert set(profiles) == {
+        "fast_learner",
+        "slow_learner",
+        "forgetful",
+        "careless",
+        "guesser",
+        "misconception_prone",
+        "cold_start_novice",
+    }
+    assert report["profile_count"] == 7
+    assert len(report["results"]) == 7 * len(CONDITIONS)
+    assert set(report["summary"]) == set(CONDITIONS)
+    assert {
+        row["profile"] for row in report["results"]
+    } == set(profiles)
+    assert all(
+        row["sessions"] == 5
+        and len(row["mastery_curve"]) == 5
+        and all(
+            0 <= point["mean_mastery"] <= 1
+            for point in row["mastery_curve"]
+        )
+        and set(row["learner_parameters"])
+        == {
+            "initial_mastery",
+            "learning_rate",
+            "forgetting_rate",
+            "slip_rate",
+            "guess_rate",
+            "misconception_rate",
+        }
+        for row in report["results"]
     )
 
 

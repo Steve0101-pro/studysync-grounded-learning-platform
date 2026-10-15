@@ -2,7 +2,7 @@
 
 import uuid
 
-from sqlalchemy import Column, Index
+from sqlalchemy import Boolean, Column, Index
 from sqlalchemy import DateTime
 from sqlalchemy import String
 from sqlalchemy import Text, ForeignKey, Integer, UniqueConstraint
@@ -201,6 +201,28 @@ class StudyContentUnit(Base):
     source = relationship("StudySource", back_populates="content_units")
 
 
+class StudyMockExam(Base):
+    __tablename__ = "study_mock_exams"
+
+    id: MappedColumn[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: MappedColumn[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    topic: MappedColumn[str] = mapped_column(String(255), nullable=False)
+    duration_seconds: MappedColumn[int] = mapped_column(Integer, nullable=False)
+    started_at: MappedColumn[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    submitted_at: MappedColumn[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    report_json: MappedColumn[dict[str, Any] | None] = mapped_column(
+        JSONB, nullable=True
+    )
+
+
 class StudyQuizQuestion(Base):
     __tablename__ = "study_quiz_questions"
 
@@ -212,6 +234,19 @@ class StudyQuizQuestion(Base):
     prompt: MappedColumn[str] = mapped_column(Text, nullable=False)
     options: MappedColumn[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
     answer_index: MappedColumn[int] = mapped_column(Integer, nullable=False)
+    assessment_type: MappedColumn[str] = mapped_column(
+        String(32), nullable=False, default="passage_selection"
+    )
+    difficulty: MappedColumn[str] = mapped_column(String(16), nullable=False, default="medium")
+    assessment_data: MappedColumn[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
+    mock_exam_id: MappedColumn[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("study_mock_exams.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     source_id: MappedColumn[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("study_sources.id", ondelete="CASCADE"), nullable=False
     )
@@ -219,6 +254,8 @@ class StudyQuizQuestion(Base):
     location_number: MappedColumn[int] = mapped_column(Integer, nullable=False)
     deduplication_key: MappedColumn[str | None] = mapped_column(String(64), nullable=True)
     answered_index: MappedColumn[int | None] = mapped_column(Integer, nullable=True)
+    answered_text: MappedColumn[str | None] = mapped_column(Text, nullable=True)
+    is_correct: MappedColumn[bool | None] = mapped_column(Boolean, nullable=True)
     created_at: MappedColumn[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

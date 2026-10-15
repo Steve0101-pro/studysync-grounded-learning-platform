@@ -11,8 +11,10 @@
   questions, answers, and retrieved/reference contexts are sent to NVIDIA's
   hosted APIs.
 - `simulate_learners.py` compares random, spaced-repetition, and adaptive
-  policies over five or more sessions. It uses synthetic simulated learners
-  and must not be reported as evidence of real learner outcomes.
+  policies over five or more sessions for fast, slow, forgetful, careless,
+  guesser, misconception-prone, and cold-start synthetic learner profiles.
+  It emits per-session mastery curves, but must not be reported as evidence
+  of real learner outcomes.
 
 The example JSON files are schema examples only. They are deliberately not
 counted as gold cases. The required reviewed dataset must contain at least 100
@@ -50,9 +52,11 @@ context precision/recall, citation precision, expected-fact coverage, and
 abstention accuracy. They cannot determine semantic entailment.
 
 The simulator emits normalized gain, exact-question repetition rate, weak-topic
-targeting rate, and mastery-estimation MAE by profile and condition. Its seed,
-profile definitions, number of sessions, and synthetic-only evidence label
-must be retained with any report.
+targeting rate, mastery-estimation MAE, and per-session mastery curves by
+profile and condition. Slip, guess, forgetting, learning, and misconception
+rates are explicit profile assumptions, not fitted learner parameters. Its
+seed, profile definitions, number of sessions, and synthetic-only evidence
+label must be retained with any report.
 
 ## RAGAS run with NVIDIA API Catalog
 

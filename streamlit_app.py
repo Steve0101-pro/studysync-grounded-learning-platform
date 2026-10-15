@@ -1,6 +1,7 @@
 import os
 import base64
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -966,9 +967,82 @@ with study_tab:
 
     with quiz_column:
         st.markdown("#### Practice a topic")
-        st.caption("Create a source-based passage question and record your answer.")
+        st.caption("Choose a course scope, then practise with source-linked passages.")
+        try:
+            quiz_sources_response = api_request("GET", "/study/sources")
+            if quiz_sources_response.ok:
+                quiz_sources = quiz_sources_response.json()
+            else:
+                quiz_sources = []
+                st.error(
+                    f"Could not load sources for practice: "
+                    f"{error_message(quiz_sources_response)}"
+                )
+        except requests.RequestException as exc:
+            quiz_sources = []
+            st.error(f"Could not load sources for practice: {exc}")
+
+        quiz_source_by_id = {source["id"]: source for source in quiz_sources}
+        quiz_scope_options = ["all", *quiz_source_by_id]
         with st.form("study_quiz_create"):
             quiz_topic = st.text_input("Topic to practise", max_chars=255)
+            assessment_type = st.selectbox(
+                "Question type",
+                options=[
+                    "passage_selection",
+                    "multiple_choice",
+                    "short_answer",
+                    "numerical",
+                ],
+                format_func=lambda value: {
+                    "passage_selection": "Find the supporting passage",
+                    "multiple_choice": "Multiple choice",
+                    "short_answer": "Short answer",
+                    "numerical": "Numerical",
+                }[value],
+            )
+            difficulty = st.selectbox(
+                "Difficulty",
+                options=["easy", "medium", "hard"],
+                format_func=str.title,
+            )
+            selected_quiz_source_id = st.selectbox(
+                "Source scope",
+                options=quiz_scope_options,
+                format_func=lambda source_id: (
+                    "All course sources"
+                    if source_id == "all"
+                    else quiz_source_by_id[source_id]["filename"]
+                ),
+                key="study_quiz_source_scope",
+            )
+            location_type = None
+            location_start_text = ""
+            location_end_text = ""
+            if selected_quiz_source_id != "all":
+                selected_quiz_source = quiz_source_by_id[selected_quiz_source_id]
+                if selected_quiz_source["source_type"] == "video":
+                    location_type = "timestamp"
+                    location_label = "timestamp (seconds)"
+                elif selected_quiz_source["filename"].casefold().endswith(".pptx"):
+                    location_type = "slide"
+                    location_label = "slide"
+                else:
+                    location_type = "page"
+                    location_label = "page"
+                start_column, end_column = st.columns(2)
+                with start_column:
+                    location_start_text = st.text_input(
+                        f"From {location_label}",
+                        key="study_quiz_location_start",
+                        placeholder="Optional",
+                    )
+                with end_column:
+                    location_end_text = st.text_input(
+                        f"To {location_label}",
+                        key="study_quiz_location_end",
+                        placeholder="Optional",
+                    )
             quiz_submitted = st.form_submit_button(
                 "Generate practice question",
                 type="primary",
@@ -978,64 +1052,354 @@ with study_tab:
             if not quiz_topic.strip():
                 st.warning("Enter a topic to practise.")
             else:
-                try:
-                    response = api_request(
-                        "POST",
-                        "/study/quizzes",
-                        json={"topic": quiz_topic.strip()},
-                    )
-                    if response.status_code == 201:
-                        st.session_state["study_quiz_payload"] = response.json()
-                    else:
-                        st.error(error_message(response))
-                except requests.RequestException as exc:
-                    st.error(f"Could not reach the study service: {exc}")
+                location_payload = {}
+                if location_start_text.strip() or location_end_text.strip():
+                    try:
+                        if not location_start_text.strip() or not location_end_text.strip():
+                            raise ValueError("Enter both ends of the location range.")
+                        location_start = int(location_start_text)
+                        location_end = int(location_end_text)
+                        if location_start < 0 or location_end < location_start:
+                            raise ValueError("Enter a valid, non-negative location range.")
+                        location_payload = {
+                            "location_type": location_type,
+                            "location_start": location_start,
+                            "location_end": location_end,
+                        }
+                    except ValueError as exc:
+                        st.warning(f"Invalid source range: {exc}")
+                        location_payload = None
+                else:
+                    location_payload = {}
 
-        quiz_payload = st.session_state.get("study_quiz_payload")
-        if quiz_payload:
-            st.write(quiz_payload["prompt"])
-            for index, option in enumerate(quiz_payload["options"]):
-                with st.expander(
-                    f"Passage {chr(65 + index)} · {option['filename']} · "
-                    f"{format_source_location(option['location_type'], option['location_number'])}"
-                ):
-                    st.write(option["content"])
-                    render_source_open_link(
-                        option,
-                        f"quiz-{quiz_payload['id']}-option-{index}",
-                    )
-            if quiz_payload.get("answered_index") is None:
-                selected_index = st.radio(
-                    "Choose the best-supported passage",
-                    options=range(len(quiz_payload["options"])),
-                    format_func=lambda index: f"Passage {chr(65 + index)}",
-                    key=f"study_quiz_answer_{quiz_payload['id']}",
-                )
-                if st.button("Check answer", key=f"study_quiz_submit_{quiz_payload['id']}"):
+                if location_payload is not None:
+                    quiz_request = {
+                        "topic": quiz_topic.strip(),
+                        "assessment_type": assessment_type,
+                        "difficulty": difficulty,
+                        **location_payload,
+                    }
+                    if selected_quiz_source_id != "all":
+                        quiz_request["source_id"] = selected_quiz_source_id
                     try:
                         response = api_request(
                             "POST",
-                            f"/study/quizzes/{quiz_payload['id']}/answer",
-                            json={"selected_index": selected_index},
+                            "/study/quizzes",
+                            json=quiz_request,
                         )
-                        if response.ok:
+                        if response.status_code == 201:
                             st.session_state["study_quiz_payload"] = response.json()
-                            st.rerun()
                         else:
                             st.error(error_message(response))
                     except requests.RequestException as exc:
                         st.error(f"Could not reach the study service: {exc}")
+
+        quiz_payload = st.session_state.get("study_quiz_payload")
+        if quiz_payload:
+            st.write(quiz_payload["prompt"])
+            quiz_type = quiz_payload.get("assessment_type", "passage_selection")
+            answer_payload = None
+            if quiz_type == "passage_selection":
+                for index, option in enumerate(quiz_payload["options"]):
+                    with st.expander(
+                        f"Passage {chr(65 + index)} · {option['filename']} · "
+                        f"{format_source_location(option['location_type'], option['location_number'])}"
+                    ):
+                        st.write(option["content"])
+                        render_source_open_link(
+                            option,
+                            f"quiz-{quiz_payload['id']}-option-{index}",
+                        )
+            if quiz_payload.get("correct") is None:
+                if quiz_type in {"passage_selection", "multiple_choice"}:
+                    selected_index = st.radio(
+                        (
+                            "Choose the best-supported passage"
+                            if quiz_type == "passage_selection"
+                            else "Choose one answer"
+                        ),
+                        options=range(len(quiz_payload["options"])),
+                        format_func=(
+                            (lambda index: f"Passage {chr(65 + index)}")
+                            if quiz_type == "passage_selection"
+                            else (lambda index: quiz_payload["options"][index]["content"])
+                        ),
+                        key=f"study_quiz_answer_{quiz_payload['id']}",
+                    )
+                    answer_payload = {"selected_index": selected_index}
+                elif quiz_type == "short_answer":
+                    typed_answer = st.text_area(
+                        "Your answer",
+                        key=f"study_quiz_text_{quiz_payload['id']}",
+                    )
+                    if typed_answer.strip():
+                        answer_payload = {"answer_text": typed_answer}
+                elif quiz_type == "numerical":
+                    numeric_column, unit_column = st.columns(2)
+                    with numeric_column:
+                        numeric_answer = st.number_input(
+                            "Your numerical answer",
+                            value=0.0,
+                            step=0.1,
+                            key=f"study_quiz_numeric_{quiz_payload['id']}",
+                        )
+                    with unit_column:
+                        numeric_unit = st.text_input(
+                            "Unit",
+                            key=f"study_quiz_unit_{quiz_payload['id']}",
+                        )
+                    if numeric_unit.strip():
+                        answer_payload = {
+                            "numerical_value": numeric_answer,
+                            "unit": numeric_unit.strip(),
+                        }
+                if st.button("Check answer", key=f"study_quiz_submit_{quiz_payload['id']}"):
+                    if answer_payload is None:
+                        st.warning("Enter an answer before checking.")
+                    else:
+                        try:
+                            response = api_request(
+                                "POST",
+                                f"/study/quizzes/{quiz_payload['id']}/answer",
+                                json=answer_payload,
+                            )
+                            if response.ok:
+                                st.session_state["study_quiz_payload"] = response.json()
+                                st.rerun()
+                            else:
+                                st.error(error_message(response))
+                        except requests.RequestException as exc:
+                            st.error(f"Could not reach the study service: {exc}")
             else:
                 if quiz_payload["correct"]:
-                    st.success("Correct — this passage best matches the topic.")
+                    st.success("Correct.")
                 else:
-                    st.warning("Not quite. Review the supporting course passage below.")
-                explanation = quiz_payload["explanation"]
-                st.markdown(
-                    f"**{explanation['filename']} · "
-                    f"{format_source_location(explanation['location_type'], explanation['location_number'])}**"
+                    st.warning("Not quite. Review the feedback and cited course source.")
+                explanation = quiz_payload.get("explanation")
+                if explanation:
+                    st.write(explanation)
+                citation = quiz_payload.get("citation")
+                if citation:
+                    citation_title = "Cited course source"
+                    if citation.get("filename"):
+                        citation_title += (
+                            f" · {citation['filename']} · "
+                            f"{format_source_location(citation['location_type'], citation['location_number'])}"
+                        )
+                    with st.expander(citation_title):
+                        st.write(citation["content"])
+                        render_source_open_link(
+                            citation,
+                            f"quiz-{quiz_payload['id']}-citation",
+                        )
+
+    st.divider()
+    st.markdown("#### Timed mock exam")
+    with st.form("study_mock_exam_create"):
+        exam_topic = st.text_input("Exam topic", max_chars=255)
+        exam_count = st.number_input(
+            "Number of questions",
+            min_value=3,
+            max_value=12,
+            value=5,
+            step=1,
+        )
+        exam_duration = st.number_input(
+            "Time limit (minutes)",
+            min_value=5,
+            max_value=180,
+            value=20,
+            step=5,
+        )
+        exam_types = st.multiselect(
+            "Question types",
+            options=["multiple_choice", "short_answer", "numerical"],
+            default=["multiple_choice", "short_answer", "numerical"],
+            format_func=lambda value: {
+                "multiple_choice": "Multiple choice",
+                "short_answer": "Short answer",
+                "numerical": "Numerical",
+            }[value],
+        )
+        exam_create_submitted = st.form_submit_button(
+            "Create verified mock exam",
+            type="primary",
+            use_container_width=True,
+        )
+    if exam_create_submitted:
+        if not exam_topic.strip():
+            st.warning("Enter a topic for the mock exam.")
+        elif not exam_types:
+            st.warning("Select at least one question type.")
+        else:
+            try:
+                exam_response = api_request(
+                    "POST",
+                    "/study/mock-exams",
+                    json={
+                        "topic": exam_topic.strip(),
+                        "question_count": int(exam_count),
+                        "duration_minutes": int(exam_duration),
+                        "assessment_types": exam_types,
+                    },
                 )
-                st.write(explanation["content"])
+                if exam_response.status_code == 201:
+                    st.session_state["study_mock_exam"] = exam_response.json()
+                    st.session_state.pop("study_mock_exam_report", None)
+                    st.rerun()
+                else:
+                    st.error(error_message(exam_response))
+            except requests.RequestException as exc:
+                st.error(f"Could not reach the study service: {exc}")
+
+    try:
+        exam_history_response = api_request("GET", "/study/mock-exams")
+        if exam_history_response.ok and exam_history_response.json():
+            exam_history = exam_history_response.json()
+            with st.expander("Resume an exam or open a past report"):
+                selected_exam_id = st.selectbox(
+                    "Saved exams",
+                    options=[item["id"] for item in exam_history],
+                    format_func=lambda exam_id: next(
+                        (
+                            f"{item['topic']} · "
+                            f"{'Completed' if item['submitted_at'] else 'In progress'}"
+                            for item in exam_history
+                            if item["id"] == exam_id
+                        ),
+                        exam_id,
+                    ),
+                    key="study_mock_exam_history_select",
+                )
+                if st.button(
+                    "Open selected exam",
+                    key="study_mock_exam_history_open",
+                ):
+                    saved_exam_response = api_request(
+                        "GET",
+                        f"/study/mock-exams/{selected_exam_id}",
+                    )
+                    if saved_exam_response.ok:
+                        saved_exam = saved_exam_response.json()
+                        if "results" in saved_exam:
+                            st.session_state["study_mock_exam_report"] = saved_exam
+                            st.session_state.pop("study_mock_exam", None)
+                        else:
+                            st.session_state["study_mock_exam"] = saved_exam
+                            st.session_state.pop("study_mock_exam_report", None)
+                        st.rerun()
+                    else:
+                        st.error(error_message(saved_exam_response))
+    except requests.RequestException as exc:
+        st.error(f"Could not load saved mock exams: {exc}")
+
+    active_exam = st.session_state.get("study_mock_exam")
+    exam_report = st.session_state.get("study_mock_exam_report")
+    if active_exam and exam_report is None:
+        deadline = datetime.fromisoformat(
+            active_exam["deadline_at"].replace("Z", "+00:00")
+        )
+        remaining_seconds = max(
+            0,
+            int((deadline - datetime.now(timezone.utc)).total_seconds()),
+        )
+        st.caption(
+            f"Time remaining when this page was refreshed: "
+            f"{remaining_seconds // 60}:{remaining_seconds % 60:02d}"
+        )
+        collected_answers = []
+        with st.form(f"study_mock_exam_answers_{active_exam['id']}"):
+            for number, exam_question in enumerate(active_exam["questions"], start=1):
+                st.markdown(f"**Question {number}.** {exam_question['prompt']}")
+                question_type = exam_question["assessment_type"]
+                answer = None
+                if question_type == "multiple_choice":
+                    selected = st.radio(
+                        "Choose one answer",
+                        options=range(len(exam_question["options"])),
+                        format_func=lambda index, question=exam_question: (
+                            question["options"][index]["content"]
+                        ),
+                        key=f"study_mock_exam_mcq_{exam_question['id']}",
+                    )
+                    answer = {"selected_index": selected}
+                elif question_type == "short_answer":
+                    typed = st.text_area(
+                        "Your answer",
+                        key=f"study_mock_exam_text_{exam_question['id']}",
+                    )
+                    if typed.strip():
+                        answer = {"answer_text": typed}
+                else:
+                    value_column, unit_column = st.columns(2)
+                    with value_column:
+                        numeric = st.number_input(
+                            "Numerical answer",
+                            value=0.0,
+                            step=0.1,
+                            key=f"study_mock_exam_numeric_{exam_question['id']}",
+                        )
+                    with unit_column:
+                        unit = st.text_input(
+                            "Unit",
+                            key=f"study_mock_exam_unit_{exam_question['id']}",
+                        )
+                    if unit.strip():
+                        answer = {"numerical_value": numeric, "unit": unit.strip()}
+                if answer is not None:
+                    collected_answers.append(
+                        {"question_id": exam_question["id"], "answer": answer}
+                    )
+            exam_submit = st.form_submit_button(
+                "Submit mock exam",
+                type="primary",
+                use_container_width=True,
+            )
+        if exam_submit:
+            try:
+                exam_response = api_request(
+                    "POST",
+                    f"/study/mock-exams/{active_exam['id']}/submit",
+                    json={"answers": collected_answers},
+                )
+                if exam_response.ok:
+                    st.session_state["study_mock_exam_report"] = exam_response.json()
+                    st.rerun()
+                else:
+                    st.error(error_message(exam_response))
+            except requests.RequestException as exc:
+                st.error(f"Could not reach the study service: {exc}")
+    elif exam_report:
+        if exam_report["expired"]:
+            st.warning("The time limit expired; submitted responses were not scored.")
+        st.metric(
+            "Mock exam score",
+            f"{exam_report['correct_answers']}/{exam_report['total_questions']} "
+            f"({exam_report['score']:.0%})",
+        )
+        st.caption(
+            f"Answered {exam_report['answered_questions']} of "
+            f"{exam_report['total_questions']} questions in "
+            f"{exam_report['elapsed_seconds'] // 60} minutes."
+        )
+        for number, result in enumerate(exam_report["results"], start=1):
+            with st.expander(
+                f"Question {number} · "
+                f"{'Correct' if result['correct'] else 'Review'}"
+            ):
+                st.write(result["question"])
+                st.write(f"**Expected answer:** {result['correct_answer']}")
+                st.write(result["feedback"])
+                citation = result["citation"]
+                if citation.get("content"):
+                    st.markdown(
+                        f"**Source:** {citation.get('filename') or 'Course material'}"
+                    )
+                    st.write(citation["content"])
+                    render_source_open_link(
+                        citation,
+                        f"mock-exam-{exam_report['id']}-question-{number}",
+                    )
 
     st.divider()
     st.markdown("#### Learning progress")

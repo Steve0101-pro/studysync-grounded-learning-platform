@@ -10,6 +10,8 @@ RUN pip install --no-cache-dir --disable-pip-version-check streamlit requests
 
 # Copy application source code
 COPY streamlit_app.py .
+COPY app/services/learning ./app/services/learning
+COPY evals/ragas-report.json ./evals/ragas-report.json
 
 # Create a non-privileged user and switch ownership
 RUN useradd --create-home --uid 10001 appuser \
@@ -21,7 +23,7 @@ EXPOSE 8501
 
 # Container internal health status check (essential for AWS Fargate stability tracking)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-	CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0', timeout=3)"
+	CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3)"
 
 # Run with custom CORS and cross-origin checks disabled for load balancing compatibility
 CMD ["streamlit", "run", "streamlit_app.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true", "--server.enableCORS=false", "--server.enableXsrfProtection=false"]

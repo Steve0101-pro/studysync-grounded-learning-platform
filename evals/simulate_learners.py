@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict, dataclass
 import json
 import random
 import sys
@@ -24,8 +25,44 @@ TOPICS = ("foundations", "application", "analysis", "synthesis")
 ITEMS_PER_TOPIC = 16
 
 
+@dataclass(frozen=True)
+class LearnerProfile:
+    initial_mastery: list[float]
+    learning_rate: float = 0.08
+    forgetting_rate: float = 0.01
+    slip_rate: float = 0.05
+    guess_rate: float = 0.1
+    misconception_rate: float = 0.0
+
+
+def _normalize_profile(value: list[float] | dict[str, Any]) -> LearnerProfile:
+    if isinstance(value, list):
+        profile = LearnerProfile(initial_mastery=value)
+    elif isinstance(value, dict):
+        profile = LearnerProfile(**value)
+    else:
+        raise ValueError("Each learner profile must be a mastery list or profile object")
+
+    if len(profile.initial_mastery) != len(TOPICS):
+        raise ValueError(
+            f"Each profile must define mastery for exactly {len(TOPICS)} topics"
+        )
+    if any(not 0 <= value <= 1 for value in profile.initial_mastery):
+        raise ValueError("Initial topic mastery values must be between zero and one")
+    for name in (
+        "learning_rate",
+        "forgetting_rate",
+        "slip_rate",
+        "guess_rate",
+        "misconception_rate",
+    ):
+        if not 0 <= getattr(profile, name) <= 1:
+            raise ValueError(f"{name} must be between zero and one")
+    return profile
+
+
 def simulate(
-    profiles: dict[str, list[float]],
+    profiles: dict[str, list[float] | dict[str, Any]],
     *,
     sessions: int = 5,
     questions_per_session: int = 3,
@@ -35,26 +72,26 @@ def simulate(
         raise ValueError("Track D learner simulation requires at least five sessions")
     if questions_per_session < 1:
         raise ValueError("questions_per_session must be positive")
-    if any(len(mastery) != len(TOPICS) for mastery in profiles.values()):
-        raise ValueError(f"Each profile must define mastery for exactly {len(TOPICS)} topics")
-    if any(not 0 <= value <= 1 for mastery in profiles.values() for value in mastery):
-        raise ValueError("Initial topic mastery values must be between zero and one")
+    normalized_profiles = {
+        name: _normalize_profile(value) for name, value in profiles.items()
+    }
 
     result_rows = []
-    for profile_name, initial_mastery in sorted(profiles.items()):
+    for profile_name, profile in sorted(normalized_profiles.items()):
         for condition in CONDITIONS:
             rng = random.Random(f"{seed}:{profile_name}:{condition}")
-            actual = dict(zip(TOPICS, initial_mastery, strict=True))
+            actual = dict(zip(TOPICS, profile.initial_mastery, strict=True))
             history: dict[str, list[tuple[bool, datetime]]] = defaultdict(list)
             last_seen: dict[str, int] = {}
             question_counts: dict[str, int] = defaultdict(int)
             selected_questions: list[str] = []
             weak_topic_picks = 0
             total_picks = 0
+            mastery_curve = []
 
             for session_index in range(sessions):
                 for topic in TOPICS:
-                    actual[topic] *= 0.99
+                    actual[topic] *= 1 - profile.forgetting_rate
                 estimated = {
                     topic: estimate_mastery(
                         history[topic],
@@ -105,10 +142,27 @@ def simulate(
                         weak_topic_picks += 1
                     total_picks += 1
 
-                    correct = rng.random() < actual[topic]
+                    response_accuracy = (
+                        actual[topic] * (1 - profile.slip_rate)
+                        + (1 - actual[topic]) * profile.guess_rate
+                    )
+                    correct = rng.random() < response_accuracy
+                    learning = (
+                        profile.learning_rate
+                        if correct
+                        else profile.learning_rate * 0.25
+                    )
+                    misconception_penalty = (
+                        profile.misconception_rate if not correct else 0.0
+                    )
                     actual[topic] = min(
                         0.98,
-                        actual[topic] + (0.08 if correct else 0.04),
+                        max(
+                            0.0,
+                            actual[topic]
+                            + learning
+                            - misconception_penalty * (1 - actual[topic]),
+                        ),
                     )
                     history[topic].append(
                         (
@@ -118,6 +172,12 @@ def simulate(
                         )
                     )
                     last_seen[topic] = session_index
+                mastery_curve.append(
+                    {
+                        "session": session_index + 1,
+                        "mean_mastery": sum(actual.values()) / len(TOPICS),
+                    }
+                )
 
             final_estimates = {
                 topic: estimate_mastery(
@@ -127,7 +187,7 @@ def simulate(
                 )
                 for topic in TOPICS
             }
-            initial_mean = sum(initial_mastery) / len(TOPICS)
+            initial_mean = sum(profile.initial_mastery) / len(TOPICS)
             final_mean = sum(actual.values()) / len(TOPICS)
             normalized_gain = (
                 (final_mean - initial_mean) / (1 - initial_mean)
@@ -138,8 +198,10 @@ def simulate(
             result_rows.append(
                 {
                     "profile": profile_name,
+                    "learner_parameters": asdict(profile),
                     "condition": condition,
                     "sessions": sessions,
+                    "mastery_curve": mastery_curve,
                     "initial_mean_mastery": initial_mean,
                     "final_mean_mastery": final_mean,
                     "normalized_gain": normalized_gain,
@@ -173,6 +235,10 @@ def simulate(
         "sessions_per_profile_condition": sessions,
         "questions_per_session": questions_per_session,
         "profile_count": len(profiles),
+        "profile_definitions": {
+            name: asdict(profile)
+            for name, profile in sorted(normalized_profiles.items())
+        },
         "conditions": list(CONDITIONS),
         "summary": summary,
         "results": result_rows,

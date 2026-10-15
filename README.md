@@ -87,8 +87,9 @@ grounded.
    transcription, attach an image or figure, or ask about an uploaded lecture
    video. These inputs feed the course tutor rather than replacing course
    retrieval with an unrelated response.
-5. **Practice.** Generate a question from a source passage, submit an answer,
-   and review the supporting passage and feedback.
+5. **Practice.** Choose a source and optional page, slide, or video-time range,
+   generate a source-passage question, submit an answer, and review its
+   supporting passage and feedback.
 6. **Review progress.** The dashboard shows source totals and practice
    outcomes. Accuracy is based on answered practice questions, not uploaded
    resources. Small samples are shown with a confidence interval; topic
@@ -254,10 +255,23 @@ currently implemented.
 
 ### Practice and dashboard
 
-Practice questions are currently source-passage selection questions. The
-dashboard calculates observed quiz accuracy from correct answers divided by
-answered questions. Uploading a source does not change this value. Sparse
-samples include a Wilson confidence interval to make uncertainty visible.
+Practice supports source-passage selection and source-grounded multiple-choice,
+short-answer, and numerical questions. Generated items are checked by a
+different configured model before being saved; if an independent verifier is
+unavailable or rejects an item, generation fails rather than exposing an
+unverified question. Short answers are graded against a source-grounded rubric
+by a configured model. Numerical answers require the expected unit and fall
+within the question's stored tolerance. Feedback includes the cited course
+passage. Set up at least two distinct model deployments for question generation
+and independent verification. Mock-exam blueprints let learners choose a question mix and count; the server
+enforces a time limit and returns a final score, per-question feedback, and
+citations at submission. Exams support up to 12 questions and 180 minutes.
+The exam history lets a learner resume an in-progress attempt or reopen a
+completed report after reconnecting with the same account.
+
+The dashboard calculates observed accuracy from answered questions of all
+supported types. Uploading a source does not change this value. Sparse samples
+include a Wilson confidence interval to make uncertainty visible.
 
 ## API overview
 
@@ -274,7 +288,11 @@ response schemas. Main route groups include:
 | `/study/tutor/stream` | Stream a tutor turn and its citation metadata. |
 | `/study/tutor/transcribe` | Transcribe a learner's recorded question. |
 | `/study/conversations` | List saved study conversations. |
-| `/study/quizzes` | Create source-based practice questions. |
+| `/study/quizzes` | Create source-grounded passage-selection, multiple-choice, short-answer, or numerical practice. |
+| `/study/mock-exams` | Create a timed, verified mixed-type mock exam. |
+| `/study/mock-exams` (GET) | List the learner's recent exams for recovery. |
+| `/study/mock-exams/{exam_id}` (GET) | Resume an active exam or retrieve its saved report. |
+| `/study/mock-exams/{exam_id}/submit` | Submit responses and receive a scored report with citations. |
 | `/study/progress` | Read source and practice progress. |
 | `/health/full` | Check API and configured service health. |
 
@@ -344,9 +362,12 @@ Apply migrations after updating the code:
   not been demonstrated.
 - Video transcripts are indexed with timestamps, but keyframe extraction and
   indexing are not implemented.
-- Assessment currently focuses on source-passage selection; a full exam
-  blueprint, numerical grading, short-answer rubric grading, and cited
-  post-exam reports remain future work.
+- Mock exams are time-limited and scored at submission. The countdown updates
+  on page refresh; answers are only persisted when the learner submits, so
+  unsent answers typed before a browser loss cannot be recovered.
+  Practice can be scoped to one source and an optional page, slide, or video
+  timestamp range; generated question text has exact-normalized deduplication,
+  not semantic deduplication.
 - Topic practice signals are heuristic and are not calibrated measures of
   student competence.
 - The saved RAGAS candidate dataset has not been human-reviewed. The reported
