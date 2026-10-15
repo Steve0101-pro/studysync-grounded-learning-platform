@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from collections.abc import AsyncIterator
 from typing import Any, Awaitable, Callable, TypedDict
 
-import httpx
 from langgraph.graph import END, START, StateGraph
 from google.genai import types
-from google.genai.errors import APIError
-from openai import AsyncOpenAI
 
 from app.config import settings
 from app.services.gemini_client import create_gemini_client
+from app.services.metrics import DEPENDENCY_LATENCY, track_dependency
+from app.services.model_runtime import get_provider_client
+from app.services.nemo_guardrails import (
+    check_studysync_input,
+    check_studysync_output,
+)
+from app.services.safety import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +126,45 @@ def _model_providers() -> list[tuple[str, str, str, str]]:
     return providers
 
 
+def _tutor_providers() -> list[tuple[str, str, str, str]]:
+    providers = _model_providers()
+    if settings.GEMINI_API_KEY.get_secret_value():
+        providers.extend(
+            (
+                "Gemini",
+                "",
+                "",
+                model,
+            )
+            for model in dict.fromkeys(
+                (settings.GEMINI_MODEL, settings.GEMINI_FALLBACK_MODEL)
+            )
+            if model
+        )
+    return providers
+
+
+def _provider_status_code(exc: Exception) -> int | None:
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    return status_code if isinstance(status_code, int) else None
+
+
+def _redacted_passages(
+    passages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    redacted: list[dict[str, Any]] = []
+    for passage in passages:
+        item = dict(passage)
+        for field in ("content", "parent_content"):
+            value = item.get(field)
+            if isinstance(value, str):
+                item[field] = redact_sensitive_text(value)
+        redacted.append(item)
+    return redacted
+
+
 def _gemini_contents(messages: list[dict[str, Any]]) -> tuple[str, list[types.Content]]:
     system_instruction = next(
         (message["content"] for message in messages if message["role"] == "system"),
@@ -155,8 +199,8 @@ async def _retrieve(state: StudyTutorState) -> dict[str, Any]:
     return {"passages": passages, "retrieval_backend": backend}
 
 
-async def _generate_answer(state: StudyTutorState) -> dict[str, str]:
-    passages = state.get("passages", [])
+async def _generate_answer(state: StudyTutorState) -> dict[str, Any]:
+    passages = _redacted_passages(state.get("passages", []))
     if not passages:
         return {
             "answer": "I couldn't find this topic in your uploaded course materials. Try another phrase or add a relevant source.",
@@ -188,71 +232,65 @@ async def _generate_answer(state: StudyTutorState) -> dict[str, str]:
             "content": f"Student question: {state['query']}\n\nCourse evidence:\n{evidence}",
         },
     ]
-    providers = _model_providers()
+    providers = _tutor_providers()
     system_instruction, contents = _gemini_contents(messages)
+    unavailable_providers: set[str] = set()
     for provider_name, base_url, api_key, model in providers:
+        if provider_name in unavailable_providers:
+            continue
         try:
-            if provider_name == "NVIDIA":
-                client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-                response = await client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": system_instruction},
-                        {"role": "user", "content": messages[-1]["content"]},
-                    ],
-                    temperature=0.2,
-                    max_tokens=700,
-                )
-                answer = response.choices[0].message.content
-            elif provider_name == "Groq":
-                client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-                response = await client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": system_instruction},
-                        {"role": "user", "content": messages[-1]["content"]},
-                    ],
-                    temperature=0.2,
-                    max_tokens=700,
-                )
-                answer = response.choices[0].message.content
-            elif provider_name == "OpenAI":
-                client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-                response = await client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": system_instruction},
-                        {"role": "user", "content": messages[-1]["content"]},
-                    ],
-                    temperature=0.2,
-                    max_tokens=700,
-                )
+            if provider_name == "Gemini":
+                async with track_dependency("llm", "gemini"):
+                    response = await client.aio.models.generate_content(
+                        model=model,
+                        contents=contents,
+                        config=_generation_config(system_instruction),
+                    )
+                answer = response.text
+            elif provider_name in {"NVIDIA", "Groq", "OpenAI"}:
+                provider_client = get_provider_client(api_key, base_url)
+                async with track_dependency("llm", provider_name.casefold()):
+                    response = await provider_client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": system_instruction},
+                            {"role": "user", "content": messages[-1]["content"]},
+                        ],
+                        temperature=0.2,
+                        max_tokens=700,
+                    )
                 answer = response.choices[0].message.content
             else:
                 raise RuntimeError(f"Unsupported provider: {provider_name}")
 
             if not answer or not answer.strip():
                 raise RuntimeError(f"{provider_name} returned an empty tutor response")
+            answer = await check_studysync_output(answer.strip())
             if not _has_valid_citations(answer, len(passages)):
                 raise RuntimeError(f"{provider_name} returned an answer without valid passage citations")
             logger.info("Study tutor response generated by %s", provider_name)
             return {"answer": answer.strip(), "generation_provider": provider_name.lower()}
-        except (APIError, httpx.HTTPError, RuntimeError, ValueError, Exception) as exc:
+        except Exception as exc:
+            status_code = _provider_status_code(exc)
+            if status_code in {401, 403}:
+                unavailable_providers.add(provider_name)
             logger.warning(
-                "Study tutor provider %s failed with %s",
+                "Study tutor provider %s failed with %s (status=%s)",
                 provider_name,
                 type(exc).__name__,
+                status_code,
             )
 
     logger.error("All configured study tutor model providers failed")
     first = passages[0]
     location = _format_location(first["location_type"], first["location_number"])
+    fallback = (
+        "The model providers are unavailable, so here is the closest matching "
+        f"course passage without additional interpretation: [1] “{first['content']}” "
+        f"({first['filename']}, {location})."
+    )
     return {
-        "answer": (
-            "The model providers are unavailable, so here is the closest matching "
-            f"course passage without additional interpretation: [1] “{first['content']}” "
-            f"({first['filename']}, {location})."
-        ),
+        "answer": await check_studysync_output(fallback),
         "generation_provider": "source_excerpt",
     }
 
@@ -280,9 +318,13 @@ _study_retrieval_graph = _build_retrieval_graph()
 
 
 async def run_study_tutor(query: str, retriever: Retriever) -> StudyTutorState:
-    return await _study_tutor_graph.ainvoke(
-        {"query": query, "retriever": retriever}
+    safe_query = await check_studysync_input(query)
+    result = await _study_tutor_graph.ainvoke(
+        {"query": safe_query, "retriever": retriever}
     )
+    if result.get("passages"):
+        result["passages"] = _redacted_passages(result["passages"])
+    return result
 
 
 def _stream_messages(
@@ -366,7 +408,7 @@ def _citation_payload(passages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "location_number": item["location_number"],
             "content": item.get("parent_content") or item["content"],
         }
-        for item in passages
+        for item in _redacted_passages(passages)
     ]
 
 
@@ -385,9 +427,17 @@ async def stream_study_tutor(
     if mastery_estimate is not None and not 0 <= mastery_estimate <= 1:
         raise ValueError("Mastery estimate must be between 0 and 1")
 
-    history = conversation_history or []
-    retrieval_query = query
-    if len(query.split()) <= 3:
+    safe_query = await check_studysync_input(query)
+    safe_visual_context = redact_sensitive_text(visual_context) if visual_context else None
+    history = [
+        {
+            **message,
+            "content": redact_sensitive_text(message.get("content", "")),
+        }
+        for message in (conversation_history or [])
+    ]
+    retrieval_query = safe_query
+    if len(safe_query.split()) <= 3:
         previous_question = next(
             (
                 message["content"]
@@ -397,23 +447,23 @@ async def stream_study_tutor(
             "",
         )
         if previous_question:
-            retrieval_query = f"{previous_question}\n{query}"
-    if visual_context:
-        retrieval_query += f"\n{visual_context[:1_500]}"
+            retrieval_query = f"{previous_question}\n{safe_query}"
+    if safe_visual_context:
+        retrieval_query += f"\n{safe_visual_context[:1_500]}"
 
     state = await _study_retrieval_graph.ainvoke(
         {"query": retrieval_query, "retriever": retriever}
     )
-    passages = state.get("passages", [])
+    passages = _redacted_passages(state.get("passages", []))
     yield {
         "type": "context",
         "passages": _citation_payload(passages),
         "retrieval_backend": state.get("retrieval_backend", "bm25"),
-        "visual_context": visual_context,
+        "visual_context": safe_visual_context,
     }
 
-    allow_image_citation = bool(visual_context)
-    if not passages and not visual_context:
+    allow_image_citation = bool(safe_visual_context)
+    if not passages and not safe_visual_context:
         yield {
             "type": "replace",
             "text": (
@@ -431,62 +481,114 @@ async def stream_study_tutor(
         return
 
     messages = _stream_messages(
-        query,
+        safe_query,
         passages,
         history,
-        visual_context,
+        safe_visual_context,
         tutoring_mode,
         mastery_estimate,
     )
-    providers = _model_providers()
-    displayed_text = False
+    providers = _tutor_providers()
     system_instruction, contents = _gemini_contents(messages)
+    unavailable_providers: set[str] = set()
     for provider_name, base_url, api_key, model in providers:
+        if provider_name in unavailable_providers:
+            continue
         answer_parts: list[str] = []
         try:
             if provider_name in {"NVIDIA", "Groq", "OpenAI"}:
-                provider_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-                response = await provider_client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": system_instruction},
-                        *messages[1:],
-                    ],
-                    temperature=0.2,
-                    max_tokens=700,
-                    stream=True,
-                )
-                async for chunk in response:
-                    choices = chunk.choices
-                    if not choices:
-                        continue
-                    content = choices[0].delta.content
-                    if content:
-                        answer_parts.append(content)
-                        displayed_text = True
-                        yield {"type": "token", "text": content}
+                provider_client = get_provider_client(api_key, base_url)
+                provider_seconds = 0.0
+                try:
+                    started_at = time.perf_counter()
+                    try:
+                        response = await provider_client.chat.completions.create(
+                            model=model,
+                            messages=[
+                                {"role": "system", "content": system_instruction},
+                                *messages[1:],
+                            ],
+                            temperature=0.2,
+                            max_tokens=700,
+                            stream=True,
+                        )
+                    finally:
+                        provider_seconds += time.perf_counter() - started_at
+                    iterator = response.__aiter__()
+                    while True:
+                        started_at = time.perf_counter()
+                        try:
+                            chunk = await iterator.__anext__()
+                        except StopAsyncIteration:
+                            break
+                        finally:
+                            provider_seconds += time.perf_counter() - started_at
+                        choices = chunk.choices
+                        if not choices:
+                            continue
+                        content = choices[0].delta.content
+                        if content:
+                            answer_parts.append(content)
+                finally:
+                    DEPENDENCY_LATENCY.labels(
+                        "llm",
+                        f"{provider_name.casefold()}_stream",
+                    ).observe(provider_seconds)
+            elif provider_name == "Gemini":
+                provider_seconds = 0.0
+                try:
+                    started_at = time.perf_counter()
+                    try:
+                        async with track_dependency("llm", "gemini_stream"):
+                            response = await client.aio.models.generate_content_stream(
+                                model=model,
+                                contents=contents,
+                                config=_generation_config(system_instruction),
+                            )
+                        async for chunk in response:
+                            if chunk.text:
+                                answer_parts.append(chunk.text)
+                    finally:
+                        provider_seconds += time.perf_counter() - started_at
+                finally:
+                    DEPENDENCY_LATENCY.labels(
+                        "llm",
+                        "gemini_stream",
+                    ).observe(provider_seconds)
             else:
                 raise RuntimeError(f"Unsupported provider: {provider_name}")
-        except (APIError, httpx.HTTPError, RuntimeError, ValueError, Exception) as exc:
+        except Exception as exc:
+            status_code = _provider_status_code(exc)
+            if status_code in {401, 403}:
+                unavailable_providers.add(provider_name)
             logger.warning(
-                "Streaming study tutor provider %s failed with %s",
+                "Streaming study tutor provider %s failed with %s (status=%s)",
                 provider_name,
                 type(exc).__name__,
+                status_code,
             )
-            if displayed_text:
-                yield {"type": "replace", "text": ""}
-                displayed_text = False
             continue
 
         answer = "".join(answer_parts).strip()
         if not answer:
             logger.warning("Streaming study tutor provider %s returned an empty response", provider_name)
             continue
+        try:
+            safe_answer = await check_studysync_output(answer)
+        except Exception as exc:
+            logger.warning(
+                "Streaming study tutor output guardrail failed with %s",
+                type(exc).__name__,
+            )
+            continue
         if _has_valid_citations(
-            answer,
+            safe_answer,
             len(passages),
             allow_image_citation=allow_image_citation,
         ):
+            output_parts = answer_parts if safe_answer == answer else [safe_answer]
+            for part in output_parts:
+                yield {"type": "token", "text": part}
             yield {
                 "type": "complete",
                 "generation_provider": provider_name.casefold(),
@@ -497,8 +599,6 @@ async def stream_study_tutor(
             return
 
         logger.warning("Streaming study tutor provider %s returned invalid citations", provider_name)
-        yield {"type": "replace", "text": ""}
-        displayed_text = False
 
     hints_first = tutoring_mode == "hints_first" or (
         tutoring_mode == "adaptive"
@@ -520,9 +620,9 @@ async def stream_study_tutor(
         )
         provider = "source_excerpt"
     else:
-        fallback = f"From the image: {' '.join(visual_context.split())} [image]"
+        fallback = f"From the image: {' '.join(safe_visual_context.split())} [image]"
         provider = "visual_excerpt"
-    yield {"type": "replace", "text": fallback}
+    yield {"type": "replace", "text": await check_studysync_output(fallback)}
     yield {
         "type": "complete",
         "generation_provider": provider,

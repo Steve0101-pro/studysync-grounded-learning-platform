@@ -1,0 +1,15 @@
+define flow check StudySync input
+  $result = execute studysync_check_input(text=$user_message)
+  if $result.is_blocked
+    bot refuse to respond
+    stop
+  if $result.is_transform
+    $user_message = $result.transform_text["user_message"]
+
+define flow check StudySync output
+  $result = execute studysync_check_output(text=$bot_message)
+  if $result.is_blocked
+    bot refuse to respond
+    stop
+  if $result.is_transform
+    $bot_message = $result.transform_text["bot_message"]

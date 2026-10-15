@@ -15,6 +15,7 @@ from typing import Any, Literal
 from urllib.parse import urljoin
 
 import anyio
+import asyncio
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import case, func, or_, select
@@ -58,6 +59,7 @@ from app.services.study_assessment import (
     normalize_answer,
 )
 from app.services.qdrant_service import index_study_passages, search_study_passages
+from app.services.metrics import track_dependency
 from app.services.neo4j_service import index_source_passages
 from app.services.media_validation import (
     ALLOWED_IMAGE_TYPES,
@@ -199,7 +201,27 @@ async def _hybrid_retrieve_study_passages(
     query: str,
     limit: int,
 ) -> tuple[list[dict], str]:
-    lexical_candidates = await _retrieve_study_units(db, user_id, query, limit=500)
+    async def retrieve_lexical():
+        async with track_dependency("database", "study_lexical_retrieval"):
+            return await _retrieve_study_units(db, user_id, query, limit=500)
+
+    async def retrieve_vector():
+        try:
+            async with track_dependency("qdrant", "study_vector_retrieval"):
+                return await anyio.to_thread.run_sync(
+                    search_study_passages,
+                    user_id,
+                    query,
+                    max(limit * 2, 10),
+                )
+        except Exception:
+            logger.exception("Qdrant study retrieval failed; using BM25 retrieval")
+            return []
+
+    lexical_candidates, vector_results = await asyncio.gather(
+        retrieve_lexical(),
+        retrieve_vector(),
+    )
     passages: dict[tuple[str, str, int, int], dict] = {}
     for score, unit, source, parent_content in lexical_candidates:
         passage = {
@@ -214,17 +236,6 @@ async def _hybrid_retrieve_study_passages(
             "cosine_score": 0.0,
         }
         passages[_passage_key(passage)] = passage
-
-    try:
-        vector_results = await anyio.to_thread.run_sync(
-            search_study_passages,
-            user_id,
-            query,
-            max(limit * 2, 10),
-        )
-    except Exception:
-        logger.exception("Qdrant study retrieval failed; using BM25 retrieval")
-        vector_results = []
 
     for result in vector_results:
         key = _passage_key(result)
@@ -672,10 +683,16 @@ async def tutor_on_study_sources(
             db, current_user.id, query, limit=5
         )
 
-    result = await run_study_tutor(q, retrieve)
+    try:
+        result = await run_study_tutor(q, retrieve)
+    except SafetyViolation as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Request blocked by safety policy",
+        ) from exc
     passages = result.get("passages", [])
     return {
-        "query": q,
+        "query": redact_sensitive_text(q),
         "answer": result.get("answer", ""),
         "grounded": bool(passages),
         "citations": [
@@ -916,6 +933,7 @@ async def stream_study_tutor_turn(
     except SafetyViolation as exc:
         raise HTTPException(status_code=400, detail="Request blocked by safety policy") from exc
 
+    transcript = redact_sensitive_text(transcript)
     student_question_parts = [part for part in (clean_query, transcript) if part]
     student_question = redact_sensitive_text("\n".join(student_question_parts))
     visual_context = redact_sensitive_text(visual_context)[:5_000]
@@ -1518,9 +1536,17 @@ async def create_study_mock_exam(
                     assessment_type,
                 )
                 await db.rollback()
+                detail = (
+                    "The independent verifier found that the generated question was "
+                    "not sufficiently supported by the selected course passages. "
+                    "Try a narrower topic or a different question mix."
+                    if "verification rejected" in str(exc).casefold()
+                    else "The mock exam could not be generated and verified by the "
+                    "configured model providers. Please retry."
+                )
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="The timed mock exam could not be fully generated and verified. Please retry.",
+                    detail=detail,
                 ) from exc
 
             if assessment_type == "multiple_choice":

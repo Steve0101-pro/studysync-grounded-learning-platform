@@ -1,4 +1,6 @@
+import asyncio
 import base64
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -119,7 +121,7 @@ async def test_study_tutor_returns_only_cited_source_text_and_flags_gaps(monkeyp
         "search_study_passages",
         lambda *_args: (_ for _ in ()).throw(RuntimeError("Qdrant unavailable")),
     )
-    monkeypatch.setattr(study_orchestration, "_model_providers", lambda: [])
+    monkeypatch.setattr(study_orchestration, "_tutor_providers", lambda: [])
 
     async def override_db():
         yield database
@@ -171,7 +173,7 @@ async def test_study_tutor_uses_fallback_model_after_primary_failure(monkeypatch
         ("NVIDIA", "https://example.test/v1", "primary-test-key", "primary-model"),
         ("Groq", "https://example.test/v1", "fallback-test-key", "fallback-model"),
     ]
-    monkeypatch.setattr(study_orchestration, "_model_providers", lambda: providers)
+    monkeypatch.setattr(study_orchestration, "_tutor_providers", lambda: providers)
     calls = []
 
     class _Completion:
@@ -190,12 +192,48 @@ async def test_study_tutor_uses_fallback_model_after_primary_failure(monkeypatch
             completion.provider = self.provider
             self.chat = SimpleNamespace(completions=completion)
 
-    monkeypatch.setattr(study_orchestration, "AsyncOpenAI", _Client)
+    monkeypatch.setattr(
+        study_orchestration,
+        "get_provider_client",
+        lambda api_key, _base_url: _Client(api_key=api_key),
+    )
     result = await study_orchestration.run_study_tutor("mitochondria", retrieve)
 
     assert calls == ["NVIDIA", "Groq"]
     assert result["generation_provider"] == "groq"
     assert "ATP [1]" in result["answer"]
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_tutor_redacts_question_and_returned_source_content(
+    monkeypatch,
+):
+    monkeypatch.setattr(study_orchestration, "_tutor_providers", lambda: [])
+    retrieved_queries = []
+
+    async def retrieve(query):
+        retrieved_queries.append(query)
+        return (
+            [
+                {
+                    "source_id": str(uuid.uuid4()),
+                    "filename": "biology.pdf",
+                    "location_type": "page",
+                    "location_number": 3,
+                    "content": "Contact student@example.com for the lab materials.",
+                }
+            ],
+            "bm25",
+        )
+
+    result = await study_orchestration.run_study_tutor(
+        "Can you find student@example.com?",
+        retrieve,
+    )
+
+    assert retrieved_queries == ["Can you find [EMAIL]?"]
+    assert "student@example.com" not in result["passages"][0]["content"]
+    assert "[EMAIL]" in result["answer"]
 
 
 @pytest.mark.asyncio
@@ -967,6 +1005,32 @@ async def test_hybrid_retrieval_combines_bm25_and_qdrant_cosine(monkeypatch):
     assert passages[0]["location_number"] == 1
     assert passages[0]["bm25_score"] > 0
     assert passages[1]["cosine_score"] == pytest.approx(0.91)
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retrieval_runs_lexical_and_vector_search_concurrently(monkeypatch):
+    lexical_started = threading.Event()
+    vector_started = threading.Event()
+
+    async def retrieve_lexical(*_args, **_kwargs):
+        lexical_started.set()
+        assert await asyncio.to_thread(vector_started.wait, 1)
+        return []
+
+    def retrieve_vector(*_args):
+        assert lexical_started.wait(1)
+        vector_started.set()
+        return []
+
+    monkeypatch.setattr(study_api, "_retrieve_study_units", retrieve_lexical)
+    monkeypatch.setattr(study_api, "search_study_passages", retrieve_vector)
+
+    passages, backend = await study_api._hybrid_retrieve_study_passages(
+        _StudyDatabase([]), uuid.uuid4(), "mitochondria ATP", 5
+    )
+
+    assert passages == []
+    assert backend == "bm25"
 
 
 def test_learning_api_is_split_by_user_workflow():

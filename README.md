@@ -80,8 +80,10 @@ grounded.
 2. **Add course materials.** Upload a PDF, PowerPoint (`.pptx`), MP4, or WebM
    file from the Study workspace. Ingestion extracts text and preserves page,
    slide, or transcript timestamp locations.
-3. **Ask a question.** The tutor searches uploaded material and streams an
-   answer. Each answer's citations identify the supporting source location.
+3. **Ask a question.** The tutor searches uploaded material and sends an
+   answer over the event stream after its complete response passes citation
+   and safety checks. Each answer's citations identify the supporting source
+   location.
    Conversation history supports follow-up questions.
 4. **Use optional media in context.** A learner can record a question for
    transcription, attach an image or figure, or ask about an uploaded lecture
@@ -191,6 +193,7 @@ The full variable list and safe placeholders are in
 | `GROQ_API_KEY` | Enables Groq transcription and optional chat fallback. |
 | `GROQ_FALLBACK_MODEL` | Groq chat model used for tutor fallback. |
 | `GEMINI_API_KEY` | Enables Gemini-based fallback features where configured. |
+| `GEMINI_MODEL`, `GEMINI_FALLBACK_MODEL` | Gemini models tried after configured OpenAI-compatible tutor providers. |
 | `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` | Enable Supabase-backed storage. |
 | `QDRANT_URL`, `QDRANT_API_KEY` | Configure Qdrant Cloud; otherwise the app may use local Qdrant storage. |
 | `REDIS_URL` | Optional Redis connection. Caching can be disabled if Redis is unavailable. |
@@ -244,14 +247,21 @@ Adaptive, Hints first, or Direct explanation from the tutor controls.
 Adaptive behavior uses recent practice history as a rough scaffolding signal.
 For a cold-start learner, it begins with hints-first behavior; this is not a
 validated diagnostic or mastery measure. If a provider fails or returns
-invalid citations, the app safely falls back to the retrieved source excerpt.
+invalid citations, the app tries the next configured provider, including
+Gemini, before safely falling back to the retrieved source excerpt. Generated
+tokens are held until the complete answer passes citation validation and
+output safety checks, so rejected provider text is never briefly shown.
 That fallback means model generation did not produce an acceptable cited
 answer; it is not an indication that the source passage is missing.
 
-Audio recordings are transcribed before tutor retrieval. Image input provides
-visual context for retrieval and the grounded tutor response. Uploaded video
-supports timestamped transcript retrieval; video keyframe indexing is not
-currently implemented.
+NeMo Guardrails runs local deterministic input and output rails that reuse
+StudySync's prompt-injection and PII filters. Questions, conversation history,
+retrieved passages, and generated answers are redacted before use or display;
+this setup does not require an external GLiNER/NIM service. Audio transcription
+tries configured Groq models and continues to Gemini when Groq authentication,
+network, or response errors occur. Image input provides visual context for
+retrieval and the grounded tutor response. Uploaded video supports timestamped
+transcript retrieval; video keyframe indexing is not currently implemented.
 
 ### Practice and dashboard
 
@@ -263,7 +273,9 @@ unverified question. Short answers are graded against a source-grounded rubric
 by a configured model. Numerical answers require the expected unit and fall
 within the question's stored tolerance. Feedback includes the cited course
 passage. Set up at least two distinct model deployments for question generation
-and independent verification. Mock-exam blueprints let learners choose a question mix and count; the server
+and independent verification; configured Gemini models are included as assessment
+fallbacks and can serve as the independent verifier. Mock-exam blueprints let
+learners choose a question mix and count; the server
 enforces a time limit and returns a final score, per-question feedback, and
 citations at submission. Exams support up to 12 questions and 180 minutes.
 The exam history lets a learner resume an in-progress attempt or reopen a
@@ -374,6 +386,29 @@ Apply migrations after updating the code:
   baselines are exploratory and do not represent verified production runs.
 - Accessibility, mobile behavior, production load, and latency targets require
   additional measurement before making claims about them.
+
+### Measuring API latency
+
+The API exposes Prometheus metrics at `/monitoring/metrics`. HTTP request
+duration is recorded by method and route template (including streamed response
+delivery), and responses include an `X-Process-Time` header. Selected downstream
+operations such as database/vector retrieval and model-provider calls are
+recorded separately in `document_intelligence_dependency_duration_seconds`.
+Hybrid lexical and vector retrieval run concurrently, and model-provider
+connections are reused with configured connect/read/write/pool timeouts.
+
+Use a representative workload and compare p50/p95/p99 before and after changes;
+the metrics are instrumentation, not evidence that a production latency target
+has been met. For Prometheus, an example p95 query is:
+
+```promql
+histogram_quantile(
+  0.95,
+  sum by (le, route) (
+    rate(document_intelligence_http_request_duration_seconds_bucket[5m])
+  )
+)
+```
 
 ## Troubleshooting
 

@@ -5,15 +5,13 @@ import json
 import logging
 from typing import Any
 
-import httpx
 from google.genai import types
-from google.genai.errors import APIError
-from groq import APIConnectionError as GroqConnectionError
-from groq import APIStatusError as GroqStatusError
 from langsmith import traceable
 
 from app.config import settings
 from app.services.gemini_client import create_gemini_client
+from app.services.metrics import track_dependency
+from app.services.model_runtime import get_provider_client
 
 logger = logging.getLogger(__name__)
 
@@ -89,30 +87,32 @@ async def _transcribe_segments(
     if not models:
         raise RuntimeError("No transcription model is configured")
 
-    failed_provider: str | None = None
+    unavailable_providers: set[str] = set()
     groq_models = {settings.GROQ_MODEL, settings.GROQ_STT_FALLBACK_MODEL}
     for index, model in enumerate(models):
         provider = "groq" if model in groq_models else "gemini"
-        if provider == failed_provider:
+        if provider in unavailable_providers:
             continue
         try:
             if provider == "groq":
                 groq_transport = getattr(client, "audio", None)
                 if groq_transport is None or not hasattr(groq_transport, "transcriptions"):
-                    from openai import AsyncOpenAI
-
-                    groq_transport = AsyncOpenAI(
-                        api_key=settings.GROQ_API_KEY.get_secret_value(),
+                    provider_client = get_provider_client(
+                        settings.GROQ_API_KEY.get_secret_value(),
                         base_url="https://api.groq.com/openai/v1",
                     )
+                    transcriptions = provider_client.audio.transcriptions
+                else:
+                    transcriptions = groq_transport.transcriptions
 
-                response = await asyncio.wait_for(
-                    groq_transport.transcriptions.create(
-                        model=model,
-                        file=(filename, file_bytes, content_type),
-                    ),
-                    timeout=settings.TRANSCRIPTION_TIMEOUT_SECONDS,
-                )
+                async with track_dependency("llm", "groq_transcription"):
+                    response = await asyncio.wait_for(
+                        transcriptions.create(
+                            model=model,
+                            file=(filename, file_bytes, content_type),
+                        ),
+                        timeout=settings.TRANSCRIPTION_TIMEOUT_SECONDS,
+                    )
                 text = getattr(response, "text", "")
                 if not text:
                     raise ValueError("Groq returned an empty transcription")
@@ -144,27 +144,36 @@ async def _transcribe_segments(
             if not normalized:
                 raise ValueError("Transcription contained no speech segments")
             return normalized
-        except (APIError, httpx.HTTPError, GroqConnectionError, GroqStatusError, TimeoutError, ValueError) as exc:
-            if index == len(models) - 1:
-                raise
-            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        except Exception as exc:
+            status_code = getattr(exc, "status_code", None)
+            if status_code is None:
+                status_code = getattr(
+                    getattr(exc, "response", None),
+                    "status_code",
+                    None,
+                )
             if status_code in {400, 401, 403}:
-                failed_provider = provider
+                unavailable_providers.add(provider)
             logger.warning(
-                "Transcription model %s failed with %s; trying next configured provider",
+                "Transcription provider %s model %s failed with %s "
+                "(status=%s); checking configured fallbacks",
+                provider,
                 model,
                 type(exc).__name__,
+                status_code,
             )
+            if index == len(models) - 1:
+                raise
     raise RuntimeError("No transcription model is configured")
 
 
 @traceable(
-    name="gemini_audio_transcription",
+    name="audio_transcription",
     run_type="llm",
-    tags=["speech-to-text", "audio", "gemini"],
+    tags=["speech-to-text", "audio"],
 )
 async def transcribe_audio(file_bytes: bytes, filename: str, content_type: str) -> str:
-    """Transcribe audio bytes using Gemini's native audio input."""
+    """Transcribe audio bytes using configured speech-to-text providers."""
     try:
         segments = await _transcribe_segments(
             file_bytes=file_bytes,
@@ -173,14 +182,14 @@ async def transcribe_audio(file_bytes: bytes, filename: str, content_type: str) 
         )
         return " ".join(str(segment["text"]) for segment in segments)
     except Exception as exc:
-        logger.error("Gemini audio transcription failed with %s", type(exc).__name__)
+        logger.error("Audio transcription failed with %s", type(exc).__name__)
         raise RuntimeError("Failed to transcribe audio data.") from exc
 
 
 @traceable(
-    name="gemini_lecture_video_transcription",
+    name="lecture_media_transcription",
     run_type="llm",
-    tags=["lecture-ingestion", "timestamps", "gemini"],
+    tags=["lecture-ingestion", "timestamps"],
 )
 async def transcribe_audio_segments(
     file_bytes: bytes,
@@ -195,5 +204,5 @@ async def transcribe_audio_segments(
             content_type=content_type,
         )
     except Exception as exc:
-        logger.error("Gemini lecture transcription failed with %s", type(exc).__name__)
+        logger.error("Lecture audio transcription failed with %s", type(exc).__name__)
         raise RuntimeError("Failed to transcribe lecture audio.") from exc

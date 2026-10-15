@@ -1,10 +1,12 @@
 import logging
+import asyncio
 import anyio
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.logging_config import setup_logging
+from app.middleware.observability import RequestMetricsMiddleware
 from app.api.documents import router as documents_router
 from app.api.multimodal_router import router as multimodal_router
 from app.api.auth import router as auth_router
@@ -20,6 +22,7 @@ from app.api.learning import (
 from app.rate_limit import setup_rate_limiting
 from app.api.redis_service import close_redis, check_redis_health, CacheMetrics
 from app.services.portkeys_service import portkeys_client
+from app.services.model_runtime import close_provider_clients
 from app.config import settings
 from app.database import check_database_connection
 from app.services.neo4j_service import close_neo4j, neo4j_health
@@ -27,6 +30,22 @@ from app.services.neo4j_service import close_neo4j, neo4j_health
 # Initialize logging
 setup_logging()
 logger = logging.getLogger(__name__)
+STARTUP_DEPENDENCY_TIMEOUT_SECONDS = 5.0
+
+
+async def _check_startup_dependency(name: str, check) -> bool:
+    try:
+        return await asyncio.wait_for(
+            check(),
+            timeout=STARTUP_DEPENDENCY_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "%s startup health check timed out after %.1f seconds",
+            name,
+            STARTUP_DEPENDENCY_TIMEOUT_SECONDS,
+        )
+        return False
 
 
 @asynccontextmanager
@@ -36,14 +55,15 @@ async def lifespan(app: FastAPI):
     logger.info("Starting application...")
     
     # Test Redis connection
-    redis_healthy = await check_redis_health()
+    redis_healthy, portkeys_healthy = await asyncio.gather(
+        _check_startup_dependency("Redis", check_redis_health),
+        _check_startup_dependency("Portkeys", portkeys_client.health_check),
+    )
     if redis_healthy:
         logger.info("Redis connection established and healthy")
     else:
         logger.warning("Redis is not available; caching will be disabled gracefully")
     
-    # Test Portkeys connection
-    portkeys_healthy = await portkeys_client.health_check()
     if portkeys_healthy:
         logger.info("Portkeys connection established and healthy")
     elif portkeys_client.enabled:
@@ -57,6 +77,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down application...")
     await close_redis()
     close_neo4j()
+    await close_provider_clients()
     logger.info("Application shutdown complete")
 
 
@@ -68,6 +89,7 @@ app = FastAPI(
 )
 
 setup_rate_limiting(app)
+app.add_middleware(RequestMetricsMiddleware)
 
 # Add CORS middleware
 app.add_middleware(
@@ -103,7 +125,10 @@ async def health_check():
 @app.get("/health/redis", tags=["Health"])
 async def redis_health_check():
     """Redis connectivity and cache statistics."""
-    redis_is_healthy = await check_redis_health()
+    redis_is_healthy = await _check_startup_dependency(
+        "Redis",
+        check_redis_health,
+    )
     cache_stats = CacheMetrics.get_stats()
     return {
         "redis_status": "healthy" if redis_is_healthy else "unhealthy",
@@ -114,10 +139,28 @@ async def redis_health_check():
 @app.get("/health/full", tags=["Health"])
 async def full_health_check():
     """Comprehensive health check including all services."""
-    database_is_healthy = await check_database_connection()
-    redis_is_healthy = await check_redis_health()
+    async def check_graph() -> dict[str, str | bool]:
+        try:
+            return await asyncio.wait_for(
+                anyio.to_thread.run_sync(neo4j_health, abandon_on_cancel=True),
+                timeout=STARTUP_DEPENDENCY_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Neo4j health check timed out after %.1f seconds",
+                STARTUP_DEPENDENCY_TIMEOUT_SECONDS,
+            )
+            return {
+                "configured": bool(settings.NEO4J_URI.strip()),
+                "status": "unhealthy",
+            }
+
+    database_is_healthy, redis_is_healthy, graph_status = await asyncio.gather(
+        _check_startup_dependency("Database", check_database_connection),
+        _check_startup_dependency("Redis", check_redis_health),
+        check_graph(),
+    )
     cache_stats = CacheMetrics.get_stats()
-    graph_status = await anyio.to_thread.run_sync(neo4j_health)
     return {
         "api_status": "healthy" if database_is_healthy else "degraded",
         "database_status": "healthy" if database_is_healthy else "unhealthy",

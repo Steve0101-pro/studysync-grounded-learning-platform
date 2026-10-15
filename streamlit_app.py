@@ -29,7 +29,7 @@ st.markdown(
     [data-testid="stSidebar"] { background: #06142a; border-right: 1px solid #172a48; }
     [data-testid="stSidebar"] * { color: var(--ink); }
     [data-testid="stSidebar"] hr { border-color: #203451; }
-    .block-container { max-width: 1500px; padding: 1rem 2rem 3rem; }
+    .block-container { max-width: 1500px; padding: 5.5rem 2rem 3rem; }
     .hero { padding: 1.35rem 0 1.1rem; margin-bottom: 1rem; }
     .hero h1 { color: var(--ink) !important; font-size: 2rem; line-height: 1.12; margin: .2rem 0 .35rem; }
     .hero p { color: var(--muted); font-size: .95rem; margin: 0; }
@@ -77,8 +77,8 @@ st.markdown(
     [data-testid="stTextInput"] input, [data-testid="stTextArea"] textarea, [data-baseweb="select"] > div, [data-baseweb="input"] > div { background: var(--surface); color: var(--ink); border-color: var(--line); }
     .stMarkdown, [data-testid="stCaptionContainer"] { color: var(--muted); }
     div[data-testid="stFileUploader"] section, div[data-testid="stFileUploader"] small { color: var(--muted); }
-    @media (max-width: 760px) { .block-container { padding: .7rem 1rem 2rem; } .brand-panel { min-height: auto; padding: 1.5rem; } .auth-shell { padding: 1.5rem; margin-top: 1rem; } }
-    body:has(.auth-mark) .block-container { padding-top: 4.5rem; padding-bottom: 0; }
+    @media (max-width: 760px) { .block-container { padding: 5rem 1rem 2rem; } .brand-panel { min-height: auto; padding: 1.5rem; } .auth-shell { padding: 1.5rem; margin-top: 1rem; } }
+    body:has(.auth-mark) .block-container { padding-top: 6rem; padding-bottom: 0; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -814,7 +814,8 @@ with study_tab:
                                     st.write(citation["content"])
                                     render_source_open_link(
                                         citation,
-                                        f"conversation-{selected_conversation_id}-{index}",
+                                        f"conversation-{selected_conversation_id}-"
+                                        f"{message['id']}-{index}",
                                     )
                 else:
                     st.error(error_message(messages_response))

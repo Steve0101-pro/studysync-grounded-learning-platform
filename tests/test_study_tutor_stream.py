@@ -92,12 +92,12 @@ def test_stream_citation_payload_uses_full_parent_context():
                 "location_type": "page",
                 "location_number": 4,
                 "content": "retrieved child fragment",
-                "parent_content": "Complete surrounding paragraph.",
+                "parent_content": "Contact student@example.com for the full paragraph.",
             }
         ]
     )
 
-    assert citations[0]["content"] == "Complete surrounding paragraph."
+    assert citations[0]["content"] == "Contact [EMAIL] for the full paragraph."
 
 
 @pytest.mark.parametrize(
@@ -145,7 +145,7 @@ async def test_streaming_tutor_retrieves_with_followup_and_visual_context(monkey
         {"passages": [passage], "retrieval_backend": "bm25+cosine"}
     )
     monkeypatch.setattr(study_orchestration, "_study_retrieval_graph", graph)
-    monkeypatch.setattr(study_orchestration, "_model_providers", lambda: [])
+    monkeypatch.setattr(study_orchestration, "_tutor_providers", lambda: [])
 
     events = [
         event
@@ -200,7 +200,7 @@ async def test_streaming_tutor_uses_fallback_provider_and_streams_tokens(monkeyp
     )
     monkeypatch.setattr(
         study_orchestration,
-        "_model_providers",
+        "_tutor_providers",
         lambda: [("Groq", "https://example.test/v1", "test-key", "test-model")],
     )
     received_messages = []
@@ -242,7 +242,11 @@ async def test_streaming_tutor_uses_fallback_provider_and_streams_tokens(monkeyp
         async def __aexit__(self, *_args):
             return None
 
-    monkeypatch.setattr(study_orchestration, "AsyncOpenAI", _Client)
+    monkeypatch.setattr(
+        study_orchestration,
+        "get_provider_client",
+        lambda *_args: _Client(),
+    )
     events = [
         event
         async for event in study_orchestration.stream_study_tutor(
@@ -265,6 +269,98 @@ async def test_streaming_tutor_uses_fallback_provider_and_streams_tokens(monkeyp
     }
     assert any(message["content"] == "Earlier question" for message in received_messages)
     assert "hints-first" in received_messages[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_provider_stream_is_not_shown_before_gemini_fallback(monkeypatch):
+    passage = {
+        "source_id": str(uuid.uuid4()),
+        "filename": "biology.pdf",
+        "location_type": "page",
+        "location_number": 4,
+        "content": "Mitochondria produce ATP.",
+    }
+    monkeypatch.setattr(
+        study_orchestration,
+        "_study_retrieval_graph",
+        _RetrievalGraph({"passages": [passage], "retrieval_backend": "bm25"}),
+    )
+    monkeypatch.setattr(
+        study_orchestration,
+        "_tutor_providers",
+        lambda: [
+            ("NVIDIA", "https://example.test/v1", "test-key", "nvidia-model"),
+            ("Gemini", "", "", "gemini-primary"),
+        ],
+    )
+
+    class _Chunk:
+        def __init__(self, content):
+            self.choices = [SimpleNamespace(delta=SimpleNamespace(content=content))]
+
+    class _OpenAIStream:
+        def __aiter__(self):
+            self._chunks = iter([_Chunk("Uncited answer that must not appear.")])
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._chunks)
+            except StopIteration as exc:
+                raise StopAsyncIteration from exc
+
+    class _OpenAICompletions:
+        async def create(self, **_kwargs):
+            return _OpenAIStream()
+
+    class _GeminiChunk:
+        text = "Mitochondria produce ATP [1]; contact student@example.com."
+
+    class _GeminiStream:
+        def __aiter__(self):
+            self.sent = False
+            return self
+
+        async def __anext__(self):
+            if self.sent:
+                raise StopAsyncIteration
+            self.sent = True
+            return _GeminiChunk()
+
+    class _GeminiModels:
+        async def generate_content_stream(self, **_kwargs):
+            return _GeminiStream()
+
+    monkeypatch.setattr(
+        study_orchestration,
+        "get_provider_client",
+        lambda *_args: SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=_OpenAICompletions(),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        study_orchestration,
+        "client",
+        SimpleNamespace(aio=SimpleNamespace(models=_GeminiModels())),
+    )
+
+    events = [
+        event
+        async for event in study_orchestration.stream_study_tutor(
+            "Explain ATP.",
+            lambda _query: None,
+        )
+    ]
+    displayed_text = "".join(
+        event["text"] for event in events if event["type"] == "token"
+    )
+
+    assert "Uncited answer" not in displayed_text
+    assert displayed_text == "Mitochondria produce ATP [1]; contact [EMAIL]."
+    assert "student@example.com" not in displayed_text
+    assert events[-1]["generation_provider"] == "gemini"
 
 
 def test_shared_media_validation_checks_declared_content_type():

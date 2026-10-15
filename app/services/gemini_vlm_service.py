@@ -9,10 +9,12 @@ from langsmith import traceable
 
 from app.config import settings
 from app.services.gemini_client import create_gemini_client
+from app.services.metrics import track_dependency
+from app.services.model_runtime import get_provider_client
 
 logger = logging.getLogger(__name__)
 
-from openai import APIStatusError, AsyncOpenAI
+from openai import APIStatusError
 
 from app.services.portkeys_service import portkeys_client
 
@@ -90,16 +92,17 @@ async def generate_response(
         if nvidia_models:
             for index, model in enumerate(nvidia_models):
                 try:
-                    client = AsyncOpenAI(
-                        api_key=settings.NVIDIA_API_KEY.get_secret_value(),
-                        base_url=settings.NVIDIA_BASE_URL,
+                    provider_client = get_provider_client(
+                        settings.NVIDIA_API_KEY.get_secret_value(),
+                        settings.NVIDIA_BASE_URL,
                     )
-                    response = await client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        temperature=0.2,
-                        max_tokens=1_000,
-                    )
+                    async with track_dependency("llm", "nvidia_multimodal"):
+                        response = await provider_client.chat.completions.create(
+                            model=model,
+                            messages=messages,
+                            temperature=0.2,
+                            max_tokens=1_000,
+                        )
                     content = response.choices[0].message.content
                     if isinstance(content, str) and content.strip():
                         return content.strip()

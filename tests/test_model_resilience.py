@@ -8,7 +8,7 @@ from openai import APIConnectionError, APIStatusError
 from pydantic import SecretStr
 
 from app.config import settings
-from app.services import gemini_vlm_service, stt, study_orchestration, vlm_service
+from app.services import gemini_vlm_service, model_runtime, stt, study_orchestration, vlm_service
 from app.services.model_runtime import provider_timeout
 
 
@@ -23,6 +23,31 @@ def test_provider_timeout_uses_configured_bounds():
     assert timeout.write == settings.MODEL_WRITE_TIMEOUT_SECONDS
     assert timeout.pool == settings.MODEL_POOL_TIMEOUT_SECONDS
     assert transcription_timeout.read == settings.TRANSCRIPTION_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_provider_clients_are_reused_and_closed(monkeypatch):
+    clients = []
+
+    class _Client:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.closed = False
+            clients.append(self)
+
+        async def close(self):
+            self.closed = True
+
+    await model_runtime.close_provider_clients()
+    monkeypatch.setattr(model_runtime, "AsyncOpenAI", _Client)
+
+    first = model_runtime.get_provider_client("test-key", "https://provider.test/v1")
+    second = model_runtime.get_provider_client("test-key", "https://provider.test/v1")
+
+    assert first is second
+    assert first.kwargs["timeout"].connect == settings.MODEL_CONNECT_TIMEOUT_SECONDS
+    await model_runtime.close_provider_clients()
+    assert first.closed is True
 
 
 def test_tutor_provider_order_includes_nvidia_model_fallback(monkeypatch):
@@ -48,6 +73,20 @@ def test_tutor_provider_order_includes_nvidia_model_fallback(monkeypatch):
         "reasoning-primary",
         "reasoning-fallback",
         "groq-chat-fallback",
+    ]
+
+
+def test_tutor_fallback_includes_configured_gemini_models(monkeypatch):
+    monkeypatch.setattr(settings, "NVIDIA_API_KEY", SecretStr(""))
+    monkeypatch.setattr(settings, "GROQ_API_KEY", SecretStr(""))
+    monkeypatch.setattr(settings, "OPENAI_API_KEY", SecretStr(""))
+    monkeypatch.setattr(settings, "GEMINI_API_KEY", SecretStr("gemini-test"))
+    monkeypatch.setattr(settings, "GEMINI_MODEL", "gemini-primary")
+    monkeypatch.setattr(settings, "GEMINI_FALLBACK_MODEL", "gemini-fallback")
+
+    assert study_orchestration._tutor_providers() == [
+        ("Gemini", "", "", "gemini-primary"),
+        ("Gemini", "", "", "gemini-fallback"),
     ]
 
 
@@ -120,6 +159,45 @@ async def test_transcription_skips_broken_provider_and_uses_gemini_fallback(monk
     assert gemini_requests == ["gemini-primary"]
 
 
+@pytest.mark.asyncio
+async def test_transcription_falls_back_after_openai_sdk_authentication_error(monkeypatch):
+    monkeypatch.setattr(settings, "GROQ_API_KEY", SecretStr("groq-test"))
+    monkeypatch.setattr(settings, "GROQ_MODEL", "whisper-primary")
+    monkeypatch.setattr(settings, "GROQ_STT_FALLBACK_MODEL", "whisper-fallback")
+    monkeypatch.setattr(settings, "GEMINI_MODEL", "gemini-primary")
+    monkeypatch.setattr(settings, "GEMINI_FALLBACK_MODEL", "gemini-fallback")
+    gemini_requests = []
+
+    class _Transcriptions:
+        async def create(self, **_kwargs):
+            response = httpx.Response(
+                401,
+                request=httpx.Request("POST", "https://api.groq.com/openai/v1/audio"),
+            )
+            raise APIStatusError("Invalid API key", response=response, body={})
+
+    class _GeminiModels:
+        async def generate_content(self, *, model, **_kwargs):
+            gemini_requests.append(model)
+            return SimpleNamespace(
+                text='{"segments":[{"start":0,"text":"recognized by Gemini"}]}'
+            )
+
+    monkeypatch.setattr(
+        stt,
+        "client",
+        SimpleNamespace(
+            audio=SimpleNamespace(transcriptions=_Transcriptions()),
+            aio=SimpleNamespace(models=_GeminiModels()),
+        ),
+    )
+
+    result = await stt.transcribe_audio(b"audio", "question.wav", "audio/wav")
+
+    assert result == "recognized by Gemini"
+    assert gemini_requests == ["gemini-primary"]
+
+
 def test_vision_uses_fallback_after_connection_failure(monkeypatch):
     monkeypatch.setattr(settings, "NVIDIA_VISION_MODEL", "vision-primary")
     monkeypatch.setattr(settings, "NVIDIA_VISION_FALLBACK_MODEL", "vision-fallback")
@@ -173,7 +251,11 @@ async def test_multimodal_uses_vision_fallback_for_missing_primary_model(monkeyp
         async def __aexit__(self, *_args):
             return None
 
-    monkeypatch.setattr(gemini_vlm_service, "AsyncOpenAI", _Client)
+    monkeypatch.setattr(
+        gemini_vlm_service,
+        "get_provider_client",
+        lambda *_args: _Client(),
+    )
 
     result = await gemini_vlm_service.generate_response(
         transcript="What is in the picture?",
